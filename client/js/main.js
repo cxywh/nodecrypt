@@ -7,6 +7,7 @@ import './NodeCrypt.js';
 import {
 	setupFileSend,
 	handleFileMessage,
+	handleBinaryVolume,
 	downloadFile
 } from './util.file.js';
 
@@ -102,6 +103,8 @@ window.joinRoom = joinRoom;
 window.notifyMessage = notifyMessage;
 window.setupEmojiPicker = setupEmojiPicker;
 window.handleFileMessage = handleFileMessage;
+// 二进制通道的分卷入站口。room.js 里注册的 onBinaryData 回调最终落到这里。
+window.handleBinaryVolume = handleBinaryVolume;
 window.downloadFile = downloadFile;
 
 // 当 DOM 内容加载完成后执行初始化逻辑
@@ -323,7 +326,16 @@ window.addEventListener('DOMContentLoaded', () => {
 						addMsg(msgWithUser, false, 'file');
 					}
 				}
-			}		}
+			}
+		},
+		// 分卷走二进制通道 —— 只有这一条路能吃到 0.017% 的链路膨胀。
+		// 私聊时必须带 targetClientId：不带的话密文会广播给全房间。
+		onSendBinary: async (record) => {
+			const rd = roomsData[activeRoomIndex];
+			if (rd && rd.chat) {
+				await rd.chat.sendChannelBinary(record, rd.privateChatTargetId || null);
+			}
+		}
 	});
 
 

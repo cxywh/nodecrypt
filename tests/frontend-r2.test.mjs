@@ -187,11 +187,13 @@ globalThis.window.roomsData = [];
 globalThis.window.activeRoomIndex = -1;
 
 const sent = [];
+const sentBinary = [];   // 走二进制通道的分卷记录（裸字节，不是 base64 字符串）
 await fileMod.setupFileSend({
 	inputSelector: '.input-message-input',
 	attachBtnSelector: '.chat-attach-btn',
 	fileInputSelector: 'input[type="file"]',
 	onSend: async (msg) => { sent.push(msg); },
+	onSendBinary: async (record) => { sentBinary.push(record); },
 });
 
 // 点一次附件按钮：setupFileSend 内部才会把回调交给 showFileUploadModal（我们的桩）
@@ -228,10 +230,65 @@ await check('发送方自己的卡片进了聊天区（本地渲染，不经中�
 
 await check('小文件仍走中继（保持原行为）', async () => {
 	sent.length = 0;
+	sentBinary.length = 0;
 	const small = new File([randomBytes(1024)], 'small.bin');
 	await __feedFiles([small]);
 	assert(sent.some(m => m.type === 'file_start'), '小文件应当走 file_start 中继路径');
 	assert(!sent.some(m => m.type === 'file_offer'), '小文件不该走 R2');
+});
+
+await check('★ 分卷改走二进制通道：裸字节，不再是 base64 + JSON', async () => {
+	const aead = await import('../client/js/aead.js');
+	sent.length = 0;
+	sentBinary.length = 0;
+	const small = new File([randomBytes(64 * 1024)], 'vol.bin');
+	await __feedFiles([small]);
+
+	// 关键回归断言：改成二进制通道后，JSON 通道里不该再出现 file_volume。
+	// 之前这里没断言，导致 onSendBinary 没接线时测试照样「全绿」——
+	// 而实际分卷已经抛 TypeError 了。
+	assert(!sent.some(m => m.type === 'file_volume'),
+		'分卷不该再走 JSON 通道（那会叠三层 base64，链路膨胀 137%）');
+	assert(sentBinary.length > 0, '分卷应当走二进制通道');
+	assert(sentBinary[0] instanceof Uint8Array,
+		`分卷记录应当是裸字节，实际是 ${Object.prototype.toString.call(sentBinary[0])}`);
+
+	const rec = aead.unpackVolumeRecord(sentBinary[0]);
+	assert(rec.fileId, 'fileId 应随记录一起传（元数据与载荷同一次 AEAD）');
+	assertEq(rec.volumeIndex, 0, '首卷卷号');
+	assertEq(rec.totalVolumes, sentBinary.length, '总卷数应与实发卷数一致');
+	assert(rec.payload.length > 0, '负载不应为空');
+});
+
+await check('★ 接收侧：handleBinaryVolume 落到正确的传输状态', async () => {
+	// 造一个接收中的传输条目，totalVolumes 故意留空 ——
+	// 验「分卷自带的数字会把进度条分母补上」（否则界面显示 NaN）
+	const fileId = 'rx-binary-1';
+	globalThis.window.fileTransfers.set(fileId, {
+		fileId, fileName: 'in.bin', originalSize: 100, compressedSize: 100,
+		totalVolumes: 0, sentVolumes: 0, status: 'receiving',
+		receivedVolumes: new Set(), volumeData: []
+	});
+
+	fileMod.handleBinaryVolume({
+		fileId, volumeIndex: 0, totalVolumes: 2,
+		payload: new Uint8Array([1, 2, 3])
+	});
+	fileMod.handleBinaryVolume({
+		fileId, volumeIndex: 1, totalVolumes: 2,
+		payload: new Uint8Array([4, 5])
+	});
+
+	const t = globalThis.window.fileTransfers.get(fileId);
+	assertEq(t.receivedVolumes.size, 2, '两卷都应记录');
+	assertEq(t.totalVolumes, 2, '总卷数应由分卷补上（file_start 未到的情况）');
+	assertEq(t.volumeData[0].length, 3, '第 0 卷负载应原样存下');
+	assertEq(t.volumeData[1][0], 4, '第 1 卷负载应原样存下');
+
+	// 未知 fileId 的卷应当安静丢弃，而不是建垃圾状态或抛错
+	const sizeBefore = globalThis.window.fileTransfers.size;
+	fileMod.handleBinaryVolume({ fileId: 'nope', volumeIndex: 0, totalVolumes: 1, payload: new Uint8Array(1) });
+	assertEq(globalThis.window.fileTransfers.size, sizeBefore, '未知 fileId 不该新建状态');
 });
 
 await check('R2 可用性探测返回布尔值且被缓存（只发一次请求）', async () => {

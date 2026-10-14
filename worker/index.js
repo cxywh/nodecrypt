@@ -1,4 +1,4 @@
-import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime, deriveServerSessionKeyBytes, importAesKey, fromHex, toHex } from './utils.js';
+import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime, deriveServerSessionKeyBytes, importAesKey, fromHex, toHex, BIN_FRAME_CHANNEL, CLIENT_ID_BYTES } from './utils.js';
 import { handleBlob } from './blob.js';
 
 // 协议版本。首帧必须带这个前缀，否则直接关连接（见 webSocketMessage）。
@@ -357,7 +357,18 @@ export class ChatRoom {
     const att = this.deserialize(ws);
     const clientId = att.clientId;
 
-    if (!isString(message) || !clientId || !this.clients[clientId]) {
+    if (!clientId || !this.clients[clientId]) {
+      return;
+    }
+
+    // 二进制帧 = 批量数据通道（文件分卷）。服务端**不做任何加解密**，只读帧头
+    // 16 字节的路由信息然后原样转发：载荷自始至终是发送方与接收方之间的 AEAD
+    // 密文，服务端既解不开也不需要解。
+    //
+    // 省掉的不只是服务端每卷一次 AES，更是链路上的两次 base64 —— 实测膨胀
+    // 从 137% 降到 0.017%（见 client/js/aead.js「二进制通道」）。
+    if (typeof message !== 'string') {
+      await this.relayBinary(ws, clientId, message);
       return;
     }
 
@@ -590,6 +601,59 @@ export class ChatRoom {
 
     } catch (error) {
       logEvent('message-client', [clientId, error], 'error');
+    }
+  }
+
+  // 转发二进制帧（批量数据）。
+  //
+  // 帧格式（客户端侧定义见 client/js/aead.js）：
+  //   [0]       0x02   帧类型
+  //   [1..16]   目标 clientId（发往服务端时）/ 来源 clientId（转发给接收方时）
+  //   [17..]    IV || 密文 || 认证标签
+  //
+  // 服务端只做两件事：读帧头找目标、把来源字段换掉。**不解析、不解密、不改动**
+  // 后面任何一个字节 —— 所以它既看不到内容，也没有机会篡改而不被发现
+  // （AEAD 认证会兜住）。
+  async relayBinary(ws, clientId, message) {
+    try {
+      const bytes = message instanceof ArrayBuffer
+        ? new Uint8Array(message)
+        : new Uint8Array(message.buffer, message.byteOffset || 0, message.byteLength);
+
+      if (bytes.length < 1 + CLIENT_ID_BYTES || bytes[0] !== BIN_FRAME_CHANNEL) {
+        // 不是本协议认识的二进制帧。不记内容（可能是任意字节，打进日志等于
+        // 把用户数据落到日志里），只记长度。
+        logEvent('binary-unknown', [clientId, bytes.length], 'debug');
+        return;
+      }
+
+      const sender = this.clients[clientId];
+      if (!sender || !sender.channel) {
+        return;
+      }
+
+      let targetId = '';
+      for (let i = 1; i <= CLIENT_ID_BYTES; i++) {
+        targetId += String.fromCharCode(bytes[i]);
+      }
+
+      const target = this.clients[targetId];
+      // 目标必须存在**且在同一频道**。少了后半句，A 就能把数据塞进别的房间 ——
+      // 密文虽然解不开，但这种「跨房间投递」本身就不该被允许。
+      if (!target || !this.isClientInChannel(target, sender.channel)) {
+        return;
+      }
+
+      const out = new Uint8Array(bytes.length);
+      out[0] = BIN_FRAME_CHANNEL;
+      for (let i = 0; i < CLIENT_ID_BYTES; i++) {
+        out[i + 1] = clientId.charCodeAt(i);
+      }
+      out.set(bytes.subarray(1 + CLIENT_ID_BYTES), 1 + CLIENT_ID_BYTES);
+
+      this.sendMessage(target.connection, out);
+    } catch (error) {
+      logEvent('binary-relay', [clientId, error], 'error');
     }
   }
 

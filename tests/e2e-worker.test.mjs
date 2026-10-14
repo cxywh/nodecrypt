@@ -50,6 +50,17 @@ const check = (name, ok, note = '') => {
 };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// 轮询等待条件成立。国内到 Cloudflare 的链路抖动大，固定 sleep 要么不够
+// 要么白等，所以等到条件满足就立刻继续。
+const waitUntil = async (cond, timeoutMs = 15000, step = 100) => {
+	const t0 = Date.now();
+	while (Date.now() - t0 < timeoutMs) {
+		if (cond()) return true;
+		await sleep(step);
+	}
+	return false;
+};
+
 const channelId = await c.sha256Hex('nodecrypt-v2|channel|' + ROOM);
 const pwKey = await c.derivePasswordKey(PASSWORD, ROOM);
 
@@ -63,11 +74,15 @@ class TestClient {
 		this.rsaPublic = null;
 		this.fingerprint = null;
 		this.errors = [];
+		this.binaryReceived = [];   // 收到的二进制分卷记录
+		this.binaryErrors = [];     // 二进制帧解密失败
 		this.ready = new Promise((res) => { this._resolveReady = res; });
 	}
 
 	async connect(attempt = 1) {
 		this.ws = new WebSocket(WS_URL);
+		// 二进制帧收成 ArrayBuffer（默认可能是 Blob，那还得 await 转一道）
+		this.ws.binaryType = 'arraybuffer';
 		// 串行化消息处理：a:'c' 帧既可能是对端公钥、也可能是业务密文，
 		// 代码靠 peer.shared 区分。并发处理会让后启动的 handler 看到 shared
 		// 仍是 null，于是把密文当公钥 -> fromHex 抛错。帧本身按序到达，串行即可。
@@ -106,7 +121,47 @@ class TestClient {
 		this.ws.send(await c.encryptAead(this.serverShared, obj));
 	}
 
+	// 按用户名找对端的 clientId（房间里只有彼此，但显式匹配更稳）
+	peerIdOf(name) {
+		for (const id in this.peers) {
+			if (this.peers[id].username === name) return id;
+		}
+		return null;
+	}
+
+	// 走二进制通道发一条分卷记录给指定对端。
+	// 注意：这里只加密一次（对端密钥），不套服务端信封 —— 这正是本次改造的核心。
+	// forgeTargetId 用来测路由守卫：用真密钥加密、但帧头指向别处。
+	async sendBinary(peerId, fileId, volumeIndex, totalVolumes, payload, forgeTargetId = null) {
+		const record = c.packVolumeRecord(fileId, volumeIndex, totalVolumes, payload);
+		const packed = await c.encryptRaw(this.peers[peerId].shared, record);
+		this.ws.send(c.packBinaryFrame(forgeTargetId || peerId, packed));
+	}
+
 	async _onMessage(raw) {
+		// 0) 二进制帧 = 批量数据通道（服务端只转发，不解密）
+		if (typeof raw !== 'string') {
+			const frame = c.unpackBinaryFrame(raw);
+			if (!frame) {
+				this.errors.push('收到形状不对的二进制帧');
+				return;
+			}
+			const peer = this.peers[frame.peerClientId];
+			if (!peer || !peer.shared) {
+				this.errors.push('二进制帧来源未协商: ' + frame.peerClientId);
+				return;
+			}
+			try {
+				this.binaryReceived.push({
+					from: frame.peerClientId,
+					...c.unpackVolumeRecord(await c.decryptRaw(peer.shared, frame.packed))
+				});
+			} catch (e) {
+				this.binaryErrors.push(String(e && e.message ? e.message : e));
+			}
+			return;
+		}
+
 		// 1) 服务端公钥（明文 JSON）
 		try {
 			const d = JSON.parse(raw);
@@ -360,6 +415,65 @@ try {
 	}
 
 	}   // end: else (R2 可用)
+
+	// -----------------------------------------------------------------------
+	console.log('\n[7] 二进制通道：分卷由服务端原样转发，不经加解密');
+
+	const alicePeerId = alice.peerIdOf('Bob');
+	const bobPeerId = bob.peerIdOf('Alice');
+	check('双方都拿到了对方的 clientId', !!alicePeerId && !!bobPeerId,
+		`Alice→Bob ${alicePeerId} / Bob→Alice ${bobPeerId}`);
+	check('clientId 是 16 位小写 hex（帧头定长 16 字节的前提）',
+		/^[0-9a-f]{16}$/.test(alicePeerId || ''), String(alicePeerId));
+
+	const total = 3;
+	// 第 2 卷故意放空载荷：空文件 / 末尾整除是最容易写错的分支
+	const vols = [randomBytes(256 * 1024), new Uint8Array(0), randomBytes(1024)];
+	const plainTotal = vols.reduce((s, v) => s + v.length, 0);
+	const t0 = Date.now();
+	for (let i = 0; i < total; i++) {
+		await alice.sendBinary(alicePeerId, 'e2e-binary-file', i, total, vols[i]);
+	}
+	const ms = Date.now() - t0;
+	await waitUntil(() => bob.binaryReceived.length >= total, 20000);
+
+	check('Bob 收齐 3 卷', bob.binaryReceived.length === total,
+		`收到 ${bob.binaryReceived.length}/${total}`);
+	check('二进制帧没有解密失败', bob.binaryErrors.length === 0, bob.binaryErrors.join('; '));
+	check('元数据随载荷一起还原（fileId / 卷号 / 总卷数）',
+		bob.binaryReceived.every((r, i) =>
+			r.fileId === 'e2e-binary-file' && r.volumeIndex === i && r.totalVolumes === total),
+		'卷号 [' + bob.binaryReceived.map(r => r.volumeIndex).join(',') + ']');
+	check('★ 按卷号归位后内容逐字节一致（含一巻空载荷）', (() => {
+		const byIdx = {};
+		for (const r of bob.binaryReceived) byIdx[r.volumeIndex] = r.payload;
+		return vols.every((v, i) => byIdx[i] && sameBytes(byIdx[i], v));
+	})());
+	check('★ 来源 clientId 被服务端改写成发送方（接收方据此选密钥）',
+		bob.binaryReceived.length > 0 && bob.binaryReceived.every(r => r.from === bobPeerId),
+		String(bob.binaryReceived[0] && bob.binaryReceived[0].from));
+	console.log(`      ${plainTotal} 字节明文分 3 卷，${ms} ms 走完`);
+
+	// 健壮性：形状/目标不对的帧必须被安静丢弃，不能让 DO 抛错或断连
+	const bobRecvBefore = bob.binaryReceived.length;
+	await alice.sendBinary(alicePeerId, 'x', 0, 1, randomBytes(64), 'ffffffffffffffff');
+	await sleep(500);
+	check('发给不存在的目标被丢弃（帧本身合法，只是目标不存在）', alice.ws.readyState === 1);
+	check('跨目标的帧没有误投给 Bob', bob.binaryReceived.length === bobRecvBefore);
+
+	alice.ws.send(new Uint8Array([0xff, 1, 2, 3]));
+	await sleep(500);
+	check('畸形二进制帧被丢弃，连接仍存活（不 500、不断连）', alice.ws.readyState === 1);
+	check('畸形帧没有污染 Bob 的接收队列', bob.binaryErrors.length === 0);
+
+	// 服务端全程没解密过任何一卷 —— 它只看到 17 字节帧头 + 密文。
+	// 这条断言是「服务端零知识」的可测形式：Bob 收到的帧头来源字段是 Alice 的
+	// clientId，而 Alice 发出的帧头目标是 Bob 的 clientId，两者都只是路由信息。
+	check('服务端只改写路由字段，未触碰密文主体', (() => {
+		// 用同一份明文、同一把密钥，服务端转发前后密文应当完全一致。
+		// 这里间接验证：Bob 能解开 = 密文未被服务端改动（AEAD 会检出任何改动）。
+		return bob.binaryErrors.length === 0;
+	})());
 
 	alice.ws.close();
 	bob.ws.close();

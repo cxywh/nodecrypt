@@ -132,7 +132,11 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 		onClientSecured: (user) => handleClientSecured(idx, user),
 		onClientList: (list, selfId) => handleClientList(idx, list, selfId),
 		onClientLeft: (clientId) => handleClientLeft(idx, clientId),
-		onClientMessage: (msg) => handleClientMessage(idx, msg)
+		onClientMessage: (msg) => handleClientMessage(idx, msg),
+		// 二进制通道：文件分卷走这里，不经过上面的 JSON 信封。
+		// （发送方向不走这里 —— 由 main.js 传给 setupFileSend 的 onSendBinary 负责，
+		//   因为 NodeCrypt 的 callbacks 里没有发送类回调。）
+		onBinaryData: (record) => window.handleBinaryVolume?.(record)
 	};
 	const chatInst = new window.NodeCrypt(window.config, callbacks);
 	chatInst.setCredentials(userName, roomName, password);

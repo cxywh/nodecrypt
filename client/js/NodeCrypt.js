@@ -20,7 +20,12 @@ import {
 	derivePasswordKey,
 	encryptAead,
 	decryptAead,
-	keyFingerprint
+	keyFingerprint,
+	encryptRaw,
+	decryptRaw,
+	packBinaryFrame,
+	unpackBinaryFrame,
+	unpackVolumeRecord
 } from './aead.js';
 
 // Main NodeCrypt class for secure communication
@@ -42,6 +47,7 @@ class NodeCrypt {
 			onClientSecured: callbacks.onClientSecured || null,
 			onClientList: callbacks.onClientList || null,
 			onClientMessage: callbacks.onClientMessage || null,
+			onBinaryData: callbacks.onBinaryData || null,
 			// 新增：拿到服务端公钥指纹时回调（指纹, 是否与上次不同）
 			onServerKeyFingerprint: callbacks.onServerKeyFingerprint || null,
 		};
@@ -114,6 +120,10 @@ class NodeCrypt {
 		this.channel = {};
 		try {
 			this.connection = new WebSocket(this.config.wsAddress);
+			// 二进制帧要以 ArrayBuffer 形式收 —— 浏览器默认给 Blob，那还得 await
+			// arrayBuffer() 转一道，白白多一次拷贝。批量数据走二进制通道，
+			// 见 aead.js 顶部「二进制通道」一节。
+			this.connection.binaryType = 'arraybuffer';
 			this.connection.onopen = this.onOpen;
 			// 串行化 onMessage —— 这是必须的，不是优化。
 			//
@@ -161,6 +171,7 @@ class NodeCrypt {
 		this.callbacks.onClientSecured = null;
 		this.callbacks.onClientList = null;
 		this.callbacks.onClientMessage = null;
+		this.callbacks.onBinaryData = null;
 		this.callbacks.onServerKeyFingerprint = null;
 		this.serverKeys = null;
 		this.serverShared = null;
@@ -207,7 +218,14 @@ class NodeCrypt {
 	// WebSocket message event handler
 	// WebSocket 消息事件处理
 	async onMessage(event) {
-		if (!event || !this.isString(event.data)) {
+		if (!event) {
+			return
+		}
+		// 二进制帧 = 批量数据通道（文件分卷），不走 JSON 信封，也不经服务端加解密。
+		// 必须先于 isString 判断 —— 否则 ArrayBuffer 会被当成「非字符串」静默丢弃，
+		// 表现是「文件传输卡在 0%，界面毫无提示」。
+		if (typeof event.data !== 'string') {
+			await this.handleBinaryFrame(event.data)
 			return
 		}
 		if (event.data === 'pong') {
@@ -559,6 +577,71 @@ class NodeCrypt {
 			}
 		}
 		return (false)
+	}
+
+	// ---------------------------------------------------------------------
+	// 二进制通道：批量数据（文件分卷）
+	// ---------------------------------------------------------------------
+	//
+	// 发送：按每个对端**各自的**会话密钥加密一次（这是 E2EE 的要求，不能共用一份
+	//       密文），每个对端一个二进制帧。服务端只按目标 clientId 原样转发。
+	// 收益：链路上只剩 12 字节 IV + 16 字节标签，实测膨胀从 137% 降到 0.017%。
+	//
+	// targetClientId：只管发给这一个对端。私聊文件必须传它 —— 否则密文会被
+	// 广播给房间里所有人（他们解不开，但「谁在传文件、传了多大」全暴露了）。
+	async sendChannelBinary(plaintext, targetClientId = null) {
+		try {
+			const targets = targetClientId
+				? [targetClientId]
+				: Object.keys(this.channel);
+			// 目标必须已完成密钥协商，否则没有密钥可加密
+			const ready = targets.filter(
+				(id) => this.channel[id] && this.channel[id].shared && this.channel[id].username
+			)
+			if (ready.length === 0) {
+				return (false)
+			}
+			let sent = 0
+			for (const clientId of ready) {
+				const packed = await encryptRaw(this.channel[clientId].shared, plaintext)
+				if (this.sendMessage(packBinaryFrame(clientId, packed))) {
+					sent++
+				}
+			}
+			return (sent > 0)
+		} catch (error) {
+			this.logEvent('sendChannelBinary', error, 'error')
+		}
+		return (false)
+	}
+
+	// 收到二进制帧：解出对端身份 -> 用它那把密钥解密 -> 交给应用层
+	async handleBinaryFrame(data) {
+		const frame = unpackBinaryFrame(data)
+		if (!frame) {
+			return
+		}
+		const peer = this.channel[frame.peerClientId]
+		if (!peer || !peer.shared) {
+			// 还没完成协商就收到帧 —— 正常竞态，不是错误，安静丢掉
+			return
+		}
+		let record
+		try {
+			record = unpackVolumeRecord(await decryptRaw(peer.shared, frame.packed))
+		} catch (error) {
+			// 解不开可能是密钥轮换途中的旧帧，也可能是篡改。
+			// 记日志但不往外抛 —— 一条坏帧不该打断整个房间的消息处理链。
+			this.logEvent('handleBinaryFrame-decrypt', error, 'error')
+			return
+		}
+		if (this.callbacks.onBinaryData) {
+			try {
+				this.callbacks.onBinaryData({ ...record, clientId: frame.peerClientId })
+			} catch (error) {
+				this.logEvent('onBinaryData-callback', error, 'error')
+			}
+		}
 	}
 
 	// Encrypt a message for the server
