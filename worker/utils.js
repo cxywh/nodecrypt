@@ -78,9 +78,18 @@ export const importAesKey = async (rawBytes) => {
 	}, false, ['encrypt', 'decrypt']);
 };
 
-/** 客户端 ↔ 服务端会话密钥。ikm = P-384 ECDH 共享秘密（48 字节）。 */
+/** 客户端 ↔ 服务端会话密钥的**原始字节**。ikm = P-384 ECDH 共享秘密（48 字节）。
+ *
+ * 为什么单独暴露字节版：Hibernation API 下 Durable Object 会被驱逐，会话状态必须
+ * 写进 ws.serializeAttachment()，而 **CryptoKey 不能结构化克隆**（写进去会直接失败）。
+ * 所以 attachment 里存这份原始字节，需要时再用 importAesKey() 还原成 CryptoKey。 */
+export const deriveServerSessionKeyBytes = async (ecdhSecret) => {
+	return hkdf(ecdhSecret, KDF_SALT_PREFIX + 'server', 'server-session', 256);
+};
+
+/** 便捷包装：直接拿到 CryptoKey。用于不需要跨驱逐保存的场合。 */
 export const deriveServerSessionKey = async (ecdhSecret) => {
-	return importAesKey(await hkdf(ecdhSecret, KDF_SALT_PREFIX + 'server', 'server-session', 256));
+	return importAesKey(await deriveServerSessionKeyBytes(ecdhSecret));
 };
 
 // ---------------------------------------------------------------------------
