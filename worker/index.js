@@ -1,4 +1,7 @@
-import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime } from './utils.js';
+import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime, deriveServerSessionKey, fromHex, toHex } from './utils.js';
+
+// 协议版本。首帧必须带这个前缀，否则直接关连接（见 handleSession）。
+const PROTOCOL_VERSION = 'NC2';
 
 export default {
   async fetch(request, env, ctx) {
@@ -174,8 +177,17 @@ export class ChatRoom {  constructor(state, env) {
         return;
       }
 
-      logEvent('message', [clientId, message], 'debug');      // Handle key exchange
+      logEvent('message', [clientId, message], 'debug');
+      // Handle key exchange
+      // 首帧格式： NC2 | 客户端 ECDH 公钥(hex)
+      // 版本前缀必须匹配，否则直接关连接。老客户端走 v1 协议，
+      // 不拦的话会在后面的 AEAD 解密阶段静默错乱，报错毫无指向性。
       if (!this.clients[clientId].shared && message.length < 2048) {
+        if (!message.startsWith(PROTOCOL_VERSION + '|')) {
+          logEvent('message-key-version', [clientId, 'unexpected handshake prefix'], 'error');
+          this.closeConnection(connection);
+          return;
+        }
         try {
           // Generate ECDH key pair using P-384 curve (equivalent to secp384r1)
           const keys = await crypto.subtle.generateKey(
@@ -188,8 +200,9 @@ export class ChatRoom {  constructor(state, env) {
           );
 
           const publicKeyBuffer = await crypto.subtle.exportKey('raw', keys.publicKey);
-          
-          // Sign the public key using PKCS1 padding (compatible with original)
+
+          // 用 RSA 私钥对这把 ECDH 公钥签名：把「临时 ECDH 身份」绑到「RSA 身份」上。
+          // 但 RSA 公钥本身未经认证，所以这是自洽性校验，不是身份认证。
           const signature = await crypto.subtle.sign(
             {
               name: 'RSASSA-PKCS1-v1_5'
@@ -199,13 +212,12 @@ export class ChatRoom {  constructor(state, env) {
           );
 
           // Convert hex string to Uint8Array for client public key
-          const clientPublicKeyHex = message;
-          const clientPublicKeyBytes = new Uint8Array(clientPublicKeyHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-          
+          const clientPublicKeyHex = message.slice(PROTOCOL_VERSION.length + 1);
+
           // Import client's public key
           const clientPublicKey = await crypto.subtle.importKey(
             'raw',
-            clientPublicKeyBytes,
+            fromHex(clientPublicKeyHex),
             { name: 'ECDH', namedCurve: 'P-384' },
             false,
             []
@@ -219,13 +231,15 @@ export class ChatRoom {  constructor(state, env) {
             },
             keys.privateKey,
             384 // P-384 produces 48 bytes (384 bits)
-          );          // Take bytes 8-40 (32 bytes) for AES-256 key
-          this.clients[clientId].shared = new Uint8Array(sharedSecretBits).slice(8, 40);
+          );
+          // 原实现： new Uint8Array(sharedSecretBits).slice(8, 40) —— 直接切字节当 AES 密钥。
+          // 现在过 HKDF-SHA256，把非均匀的 ECDH 输出提取成均匀密钥材料。
+          this.clients[clientId].shared = await deriveServerSessionKey(new Uint8Array(sharedSecretBits));
 
-          const response = Array.from(new Uint8Array(publicKeyBuffer))
-            .map(b => b.toString(16).padStart(2, '0')).join('') + 
+          const response = PROTOCOL_VERSION + '|' +
+            toHex(new Uint8Array(publicKeyBuffer)) +
             '|' + btoa(String.fromCharCode(...new Uint8Array(signature)));
-          
+
           this.sendMessage(connection, response);
 
         } catch (error) {
@@ -238,7 +252,7 @@ export class ChatRoom {  constructor(state, env) {
 
       // Handle encrypted messages
       if (this.clients[clientId].shared && message.length <= (8 * 1024 * 1024)) {
-        this.processEncryptedMessage(clientId, message);
+        await this.processEncryptedMessage(clientId, message);
       }
     });    // Handle connection close
     connection.addEventListener('close', async (event) => {
@@ -256,8 +270,10 @@ export class ChatRoom {  constructor(state, env) {
             const members = this.channels[channel];
 
             for (const member of members) {
-              const client = this.clients[member];              if (this.isClientInChannel(client, channel)) {
-                this.sendMessage(client.connection, encryptMessage({
+              const client = this.clients[member];
+
+              if (this.isClientInChannel(client, channel)) {
+                this.sendMessage(client.connection, await encryptMessage({
                   a: 'l',
                   p: members.filter((value) => {
                     return (value !== member ? true : false);
@@ -278,11 +294,11 @@ export class ChatRoom {  constructor(state, env) {
     });
   }
   // Process encrypted messages
-  processEncryptedMessage(clientId, message) {
+  async processEncryptedMessage(clientId, message) {
     let decrypted = null;
 
     try {
-      decrypted = decryptMessage(message, this.clients[clientId].shared);
+      decrypted = await decryptMessage(message, this.clients[clientId].shared);
 
       logEvent('message-decrypted', [clientId, decrypted], 'debug');
 
@@ -293,11 +309,11 @@ export class ChatRoom {  constructor(state, env) {
       const action = decrypted.a;
 
       if (action === 'j') {
-        this.handleJoinChannel(clientId, decrypted);
+        await this.handleJoinChannel(clientId, decrypted);
       } else if (action === 'c') {
-        this.handleClientMessage(clientId, decrypted);
+        await this.handleClientMessage(clientId, decrypted);
       } else if (action === 'w') {
-        this.handleChannelMessage(clientId, decrypted);
+        await this.handleChannelMessage(clientId, decrypted);
       }
 
     } catch (error) {
@@ -307,7 +323,7 @@ export class ChatRoom {  constructor(state, env) {
     }
   }
   // Handle channel join requests
-  handleJoinChannel(clientId, decrypted) {
+  async handleJoinChannel(clientId, decrypted) {
     if (!isString(decrypted.p) || this.clients[clientId].channel) {
       return;
     }
@@ -323,14 +339,14 @@ export class ChatRoom {  constructor(state, env) {
         this.channels[channel].push(clientId);
       }
 
-      this.broadcastMemberList(channel);
+      await this.broadcastMemberList(channel);
 
     } catch (error) {
       logEvent('message-join', [clientId, error], 'error');
     }
   }
   // Handle client messages
-  handleClientMessage(clientId, decrypted) {
+  async handleClientMessage(clientId, decrypted) {
     if (!isString(decrypted.p) || !isString(decrypted.c) || !this.clients[clientId].channel) {
       return;
     }
@@ -346,7 +362,7 @@ export class ChatRoom {  constructor(state, env) {
           c: clientId
         };
 
-        const encrypted = encryptMessage(messageObj, targetClient.shared);
+        const encrypted = await encryptMessage(messageObj, targetClient.shared);
         this.sendMessage(targetClient.connection, encrypted);
 
         messageObj.p = null;
@@ -356,7 +372,7 @@ export class ChatRoom {  constructor(state, env) {
       logEvent('message-client', [clientId, error], 'error');
     }
   }  // Handle channel messages
-  handleChannelMessage(clientId, decrypted) {
+  async handleChannelMessage(clientId, decrypted) {
     if (!isObject(decrypted.p) || !this.clients[clientId].channel) {
       return;
     }
@@ -376,7 +392,9 @@ export class ChatRoom {  constructor(state, env) {
           a: 'c',
           p: decrypted.p[member],
           c: clientId
-        };        const encrypted = encryptMessage(messageObj, targetClient.shared);
+        };
+
+        const encrypted = await encryptMessage(messageObj, targetClient.shared);
         this.sendMessage(targetClient.connection, encrypted);
 
         messageObj.p = null;
@@ -387,7 +405,7 @@ export class ChatRoom {  constructor(state, env) {
     }
   }
   // Broadcast member list to channel
-  broadcastMemberList(channel) {
+  async broadcastMemberList(channel) {
     try {
       const members = this.channels[channel];
 
@@ -402,7 +420,7 @@ export class ChatRoom {  constructor(state, env) {
             })
           };
 
-          const encrypted = encryptMessage(messageObj, client.shared);
+          const encrypted = await encryptMessage(messageObj, client.shared);
           this.sendMessage(client.connection, encrypted);
 
           messageObj.p = null;

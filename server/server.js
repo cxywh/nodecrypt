@@ -51,6 +51,31 @@ const config = {
 	debug: false
 };
 
+// ---------------------------------------------------------------------------
+// v2 协议参数（必须与 client/js/aead.js 和 worker/utils.js 完全一致）
+// ---------------------------------------------------------------------------
+const PROTOCOL_VERSION = 'NC2';
+const KDF_SALT_PREFIX = 'nodecrypt-v2|';
+const AEAD_NONCE_BYTES = 12;
+const AEAD_TAG_BYTES = 16;
+const AEAD_AAD = Buffer.from('nodecrypt-v2', 'utf8');
+
+/**
+ * 客户端 ↔ 服务端会话密钥。
+ * 原实现是 computeSecret(...).slice(8, 40) 直接切字节当 AES 密钥；
+ * 现在过 HKDF-SHA256，把非均匀的 ECDH 输出提取成均匀密钥材料。
+ * @returns {Buffer} 32 字节密钥
+ */
+const deriveServerSessionKey = (ecdhSecret) => {
+	return Buffer.from(crypto.hkdfSync(
+		'sha256',
+		ecdhSecret,
+		Buffer.from(KDF_SALT_PREFIX + 'server', 'utf8'),
+		Buffer.from('server-session', 'utf8'),
+		32
+	));
+};
+
 
 const wss = new ws.Server({
 	host: config.wsHost,
@@ -151,6 +176,14 @@ wss.on('connection', (connection) => {
 		) {
 
 
+			// v2 协议：首帧必须是 NC2|客户端P-384公钥(hex)
+			// 老客户端走 v1 协议，不拦的话会在后面的 AEAD 解密阶段静默错乱
+			if (!message.startsWith(PROTOCOL_VERSION + '|')) {
+				logEvent('message-key-version', [clientId, 'unexpected handshake prefix'], 'error');
+				closeConnection(connection);
+				return;
+			}
+
 			try {
 
 				const keys = crypto.createECDH('secp384r1');
@@ -164,9 +197,12 @@ wss.on('connection', (connection) => {
 					dsaEncoding: 'ieee-p1363'
 				});
 
-				clients[clientId].shared = keys.computeSecret(message, 'hex', null).slice(8, 40);
+				// 原实现： keys.computeSecret(message, 'hex', null).slice(8, 40)
+				clients[clientId].shared = deriveServerSessionKey(
+					keys.computeSecret(message.slice(PROTOCOL_VERSION.length + 1), 'hex', null)
+				);
 
-				sendMessage(connection, publicKey.toString('hex') + '|' + signature.toString('base64'));
+				sendMessage(connection, PROTOCOL_VERSION + '|' + publicKey.toString('hex') + '|' + signature.toString('base64'));
 
 			} catch (error) {
 				logEvent('message-key', [clientId, error], 'error');
@@ -497,17 +533,20 @@ const encryptMessage = (message, key) => {
 
 	try {
 
-		const messageBuffer = Buffer.from(JSON.stringify(message), 'utf8');
+		// v2：AES-256-GCM（AEAD）。不再需要零填充，认证标签由算法自带。
+		// 改动点：createCipheriv('aes-256-cbc') -> ('aes-256-gcm')，
+		//        去掉 setAutoPadding(false)，加 setAAD，把 tag 拼到密文后面。
+		const iv = crypto.randomBytes(AEAD_NONCE_BYTES);
+		const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+		cipher.setAAD(AEAD_AAD);
 
-		const paddedBuffer = (messageBuffer.length % 16) !== 0 ?
-			Buffer.concat([messageBuffer, Buffer.alloc(16 - (messageBuffer.length % 16))]) :
-			messageBuffer;
+		const body = Buffer.concat([
+			cipher.update(Buffer.from(JSON.stringify(message), 'utf8')),
+			cipher.final()
+		]);
 
-		const iv = crypto.randomBytes(16);
-		const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-		cipher.setAutoPadding(false);
-
-		encrypted = iv.toString('base64') + '|' + cipher.update(paddedBuffer, '', 'base64') + cipher.final('base64');
+		encrypted = iv.toString('base64') + '|' +
+			Buffer.concat([body, cipher.getAuthTag()]).toString('base64');
 
 	} catch (error) {
 		logEvent('encryptMessage', error, 'error');
@@ -525,18 +564,31 @@ const decryptMessage = (message, key) => {
 	try {
 
 		const parts = message.split('|');
+		if (parts.length !== 2 || !parts[0] || !parts[1]) {
+			return ({});
+		}
+
+		// 尾部 16 字节是 GCM 认证标签
+		const blob = Buffer.from(parts[1], 'base64');
+		if (blob.length < AEAD_TAG_BYTES) {
+			return ({});
+		}
+
 		const decipher = crypto.createDecipheriv(
-			'aes-256-cbc',
+			'aes-256-gcm',
 			key,
 			Buffer.from(parts[0], 'base64')
 		);
+		decipher.setAAD(AEAD_AAD);
+		decipher.setAuthTag(blob.subarray(blob.length - AEAD_TAG_BYTES));
 
-		decipher.setAutoPadding(false);
-
-		const decryptedText = decipher.update(parts[1], 'base64', 'utf8') + decipher.final('utf8');
-		decrypted = JSON.parse(decryptedText.replace(/\0+$/, ''));
+		const decryptedText = decipher.update(blob.subarray(0, blob.length - AEAD_TAG_BYTES), '', 'utf8') +
+			decipher.final('utf8');
+		decrypted = JSON.parse(decryptedText);
 
 	} catch (error) {
+		// AEAD 认证失败（密文被改动 / 密钥不对）会走到这里。
+		// 原 CBC 实现没有这个能力：它要么解出乱码，要么在 JSON.parse 处报错。
 		logEvent('decryptMessage', error, 'error');
 	}
 

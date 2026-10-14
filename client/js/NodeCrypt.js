@@ -1,20 +1,27 @@
 ﻿// NodeCrypt core cryptographic client for secure chat
 // NodeCrypt 安全聊天的核心加密客户端
+//
+// P0 改造：所有密码学原语迁到 WebCrypto + AEAD（见 ./aead.js）。
+// 已移除的依赖：js-sha256、elliptic、aes-js、js-chacha20、buffer。
+// 已移除的全局污染：window.Buffer = Buffer
 
 import {
-	sha256
-} from 'js-sha256';
-import {
-	ec as elliptic
-} from 'elliptic';
-import {
-	ModeOfOperation
-} from 'aes-js';
-import chacha from 'js-chacha20';
-import {
-	Buffer
-} from 'buffer';
-window.Buffer = Buffer;
+	PROTOCOL_VERSION,
+	sha256Hex,
+	toHex,
+	toB64,
+	fromB64,
+	fromHex,
+	generateEcdhKeyPair,
+	exportEcdhPublic,
+	deriveEcdhSecret,
+	deriveServerSessionKey,
+	derivePeerSessionKey,
+	derivePasswordKey,
+	encryptAead,
+	decryptAead,
+	keyFingerprint
+} from './aead.js';
 
 // Main NodeCrypt class for secure communication
 // 用于安全通信的 NodeCrypt 主类
@@ -35,20 +42,20 @@ class NodeCrypt {
 			onClientSecured: callbacks.onClientSecured || null,
 			onClientList: callbacks.onClientList || null,
 			onClientMessage: callbacks.onClientMessage || null,
+			// 新增：拿到服务端公钥指纹时回调（指纹, 是否与上次不同）
+			onServerKeyFingerprint: callbacks.onServerKeyFingerprint || null,
 		};
-		this.SERVER_KEY_STORAGE = 'nodecrypt_server_key';
-		try {
-			this.clientEc = new elliptic('curve25519')
-		} catch (error) {
-			this.logEvent('constructor', error, 'error')
-		}
+		this.SERVER_KEY_STORAGE = 'nodecrypt_server_key_fingerprint';
 		this.serverKeys = null;
 		this.serverShared = null;
+		this.serverKeyFingerprint = null;
+		this.serverKeyChanged = false;
 		this.credentials = null;
 		this.connection = null;
 		this.reconnect = null;
 		this.ping = null;
 		this.channel = {};
+		this.passwordKey = null;
 		this.setCredentials = this.setCredentials.bind(this);
 		this.connect = this.connect.bind(this);
 		this.destruct = this.destruct.bind(this);
@@ -74,14 +81,18 @@ class NodeCrypt {
 
 	// Set user credentials (username, channel, password)
 	// 设置用户凭证（用户名、频道、密码）
+	// 注意：不再在这里做 sha256(password)。房间标识和口令派生都是异步的，
+	// 放到 onOpen 里算（那里是 async 上下文）。
 	setCredentials(username, channel, password) {
 		this.logEvent('setCredentials');
 		try {
 			this.credentials = {
 				username: username,
-				channel: sha256(channel),
-				password: sha256(password)
-			}
+				channelName: channel,
+				channelId: null,
+				password: password
+			};
+			this.passwordKey = null;
 		} catch (error) {
 			this.logEvent('setCredentials', error, 'error');
 			return (false)
@@ -134,9 +145,10 @@ class NodeCrypt {
 		this.callbacks.onClientSecured = null;
 		this.callbacks.onClientList = null;
 		this.callbacks.onClientMessage = null;
-		this.clientEc = null;
+		this.callbacks.onServerKeyFingerprint = null;
 		this.serverKeys = null;
 		this.serverShared = null;
+		this.passwordKey = null;
 		this.credentials = null;
 		this.connection.onopen = null;
 		this.connection.onmessage = null;
@@ -163,12 +175,14 @@ class NodeCrypt {
 		this.logEvent('onOpen');
 		this.startPing();
 		try {
-			this.serverKeys = await crypto.subtle.generateKey({
-				name: 'ECDH',
-				namedCurve: 'P-384'
-			}, false, ['deriveKey', 'deriveBits']);
+			// 房间标识：服务端只用它当不透明的房间桶名，不是安全边界
+			this.credentials.channelId = await sha256Hex('nodecrypt-v2|channel|' + this.credentials.channelName);
+			// 口令派生一次就缓存，后面每个对端复用（否则每加一个人重跑 60 万次 PBKDF2）
+			this.passwordKey = await derivePasswordKey(this.credentials.password, this.credentials.channelName);
+			this.serverKeys = await generateEcdhKeyPair('P-384');
 			this.serverShared = null;
-			this.sendMessage(Buffer.from(await crypto.subtle.exportKey('raw', this.serverKeys.publicKey)).toString('hex'))
+			// 握手首帧带协议版本前缀，服务端据此拒绝老客户端，避免静默错乱
+			this.sendMessage(PROTOCOL_VERSION + '|' + await exportEcdhPublic(this.serverKeys));
 		} catch (error) {
 			this.logEvent('onOpen', error, 'error')
 		}
@@ -195,29 +209,33 @@ class NodeCrypt {
 		} catch (e) {}
 		if (!this.serverShared) {
 			const parts = event.data.split('|');
-			if (!parts[0] || !parts[1]) {
+			// 格式： NC2 | 服务端 ECDH 公钥(hex) | RSA 签名(b64)
+			if (parts[0] !== PROTOCOL_VERSION || !parts[1] || !parts[2]) {
+				this.logEvent('onMessage', '握手首帧不是 ' + PROTOCOL_VERSION + ' 格式，忽略（可能是老客户端或中间人）', 'error');
 				return
 			}
 			try {
-				if (await crypto.subtle.verify({
+				const verified = await crypto.subtle.verify({
 						name: 'RSASSA-PKCS1-v1_5'
-					}, await crypto.subtle.importKey('spki', Buffer.from(this.config.rsaPublic, 'base64'), {
+					},
+					await crypto.subtle.importKey('spki', fromB64(this.config.rsaPublic), {
 						name: 'RSASSA-PKCS1-v1_5',
 						hash: {
 							name: 'SHA-256'
 						}
-					}, false, ['verify']), Buffer.from(parts[1], 'base64'), Buffer.from(parts[0], 'hex')) === true) {
-					this.serverShared = Buffer.from(await crypto.subtle.deriveBits({
-						name: 'ECDH',
-						namedCurve: 'P-384',
-						public: await crypto.subtle.importKey('raw', Buffer.from(parts[0], 'hex'), {
-							name: 'ECDH',
-							namedCurve: 'P-384'
-						}, true, [])
-					}, this.serverKeys.privateKey, 384)).slice(8, 40);
-					this.sendMessage(this.encryptServerMessage({
+					}, false, ['verify']),
+					fromB64(parts[2]),
+					fromHex(parts[1])
+				);
+				// 说明：这一步只证明「持该 RSA 私钥者同时持这把 ECDH 私钥」= 自洽性。
+				// RSA 公钥本身未经认证，所以它**不是**身份认证，更不防中间人。
+				// 真正的保护来自房间口令（见 aead.js 顶部说明）。
+				if (verified === true) {
+					const secret = await deriveEcdhSecret(this.serverKeys.privateKey, parts[1], 'P-384');
+					this.serverShared = await deriveServerSessionKey(secret);
+					this.sendMessage(await this.encryptServerMessage({
 						a: 'j',
-						p: this.credentials.channel
+						p: this.credentials.channelId
 					}, this.serverShared));
 					if (this.callbacks.onServerSecured) {
 						try {
@@ -232,7 +250,7 @@ class NodeCrypt {
 			}
 			return
 		}
-		const serverDecrypted = this.decryptServerMessage(event.data, this.serverShared);
+		const serverDecrypted = await this.decryptServerMessage(event.data, this.serverShared);
 		this.logEvent('onMessage-server-decrypted', serverDecrypted);
 		if (!this.isObject(serverDecrypted) || !this.isString(serverDecrypted.a)) {
 			return
@@ -249,14 +267,14 @@ class NodeCrypt {
 					if (!this.channel[clientId]) {
 						this.channel[clientId] = {
 							username: null,
-							keys: this.clientEc.genKeyPair(),
+							keys: await generateEcdhKeyPair('P-256'),
 							shared: null,
 						};
-						payloads[clientId] = this.channel[clientId].keys.getPublic('hex')
+						payloads[clientId] = await exportEcdhPublic(this.channel[clientId].keys)
 					}
 				}
 				if (Object.keys(payloads).length > 0) {
-					this.sendMessage(this.encryptServerMessage({
+					this.sendMessage(await this.encryptServerMessage({
 						a: 'w',
 						p: payloads,
 					}, this.serverShared))
@@ -290,19 +308,30 @@ class NodeCrypt {
 				if (!this.channel[serverDecrypted.c]) {
 					this.channel[serverDecrypted.c] = {
 						username: null,
-						keys: this.clientEc.genKeyPair(),
+						keys: await generateEcdhKeyPair('P-256'),
 						shared: null,
 					};
-					this.sendMessage(this.encryptServerMessage({
+					this.sendMessage(await this.encryptServerMessage({
 						a: 'c',
-						p: this.channel[serverDecrypted.c].keys.getPublic('hex'),
+						p: await exportEcdhPublic(this.channel[serverDecrypted.c].keys),
 						c: serverDecrypted.c
 					}, this.serverShared))
 				}
-				this.channel[serverDecrypted.c].shared = Buffer.from(this.xorHex(this.channel[serverDecrypted.c].keys.derive(this.clientEc.keyFromPublic(serverDecrypted.p, 'hex').getPublic()).toString('hex').padEnd(64, '8').substr(0, 64), this.credentials.password), 'hex');
-				this.sendMessage(this.encryptServerMessage({
+				// 会话密钥 = HKDF(ikm = ECDH秘密 ‖ PBKDF2(口令), salt = 房间标识)
+				// 两个因子缺一不可：中继冒充服务端也拿不到口令
+				const secret = await deriveEcdhSecret(
+					this.channel[serverDecrypted.c].keys.privateKey,
+					serverDecrypted.p,
+					'P-256'
+				);
+				this.channel[serverDecrypted.c].shared = await derivePeerSessionKey(
+					secret,
+					this.passwordKey,
+					this.credentials.channelId
+				);
+				this.sendMessage(await this.encryptServerMessage({
 					a: 'c',
-					p: this.encryptClientMessage({
+					p: await this.encryptClientMessage({
 						a: 'u',
 						p: this.credentials.username
 					}, this.channel[serverDecrypted.c].shared),
@@ -314,7 +343,7 @@ class NodeCrypt {
 			return
 		}
 		if (serverDecrypted.a === 'c' && this.channel[serverDecrypted.c] && this.channel[serverDecrypted.c].shared) {
-			const clientDecrypted = this.decryptClientMessage(serverDecrypted.p, this.channel[serverDecrypted.c].shared);
+			const clientDecrypted = await this.decryptClientMessage(serverDecrypted.p, this.channel[serverDecrypted.c].shared);
 			this.logEvent('onMessage-client-decrypted', clientDecrypted);
 			if (!this.isObject(clientDecrypted) || !this.isString(clientDecrypted.a)) {
 				return
@@ -332,7 +361,8 @@ class NodeCrypt {
 					}
 				}
 				return
-			}			if (!this.channel[serverDecrypted.c].username) {
+			}
+			if (!this.channel[serverDecrypted.c].username) {
 				return
 			}
 			if (clientDecrypted.a === 'm' && this.isString(clientDecrypted.t) && (this.isString(clientDecrypted.d) || this.isObject(clientDecrypted.d))) {
@@ -481,13 +511,13 @@ class NodeCrypt {
 
 	// Send a message to all channels
 	// 向所有频道发送消息
-	sendChannelMessage(type, data) {
+	async sendChannelMessage(type, data) {
 		if (this.serverShared) {
 			try {
 				let payloads = {};
 				for (const clientId in this.channel) {
 					if (this.channel[clientId].shared && this.channel[clientId].username) {
-						payloads[clientId] = this.encryptClientMessage({
+						payloads[clientId] = await this.encryptClientMessage({
 							a: 'm',
 							t: type,
 							d: data
@@ -498,7 +528,7 @@ class NodeCrypt {
 					}
 				}
 				if (Object.keys(payloads).length > 0) {
-					const payload = this.encryptServerMessage({
+					const payload = await this.encryptServerMessage({
 						a: 'w',
 						p: payloads,
 					}, this.serverShared);
@@ -517,78 +547,47 @@ class NodeCrypt {
 
 	// Encrypt a message for the server
 	// 加密发送给服务器的消息
-	encryptServerMessage(message, key) {
-		let encrypted = '';
+	async encryptServerMessage(message, key) {
 		try {
-			message = Buffer.from(JSON.stringify(message), 'utf8');
-			if ((message.length % 16) !== 0) {
-				message = Buffer.from([...message, ...Buffer.alloc(16 - (message.length % 16))])
-			}
-			const iv = Buffer.from(crypto.getRandomValues(new Uint8Array(16)));
-			const cipher = new ModeOfOperation.cbc(key, iv);
-			encrypted = iv.toString('base64') + '|' + Buffer.from(cipher.encrypt(message)).toString('base64')
+			return await encryptAead(key, message)
 		} catch (error) {
 			this.logEvent('encryptServerMessage', error, 'error')
+			return ('')
 		}
-		return (encrypted)
 	}
 
 	// Decrypt a message from the server
 	// 解密来自服务器的消息
-	decryptServerMessage(message, key) {
-		let decrypted = {};
+	async decryptServerMessage(message, key) {
 		try {
-			const parts = message.split('|');
-			const decipher = new ModeOfOperation.cbc(key, Buffer.from(parts[0], 'base64'));
-			decrypted = JSON.parse(Buffer.from(decipher.decrypt(Buffer.from(parts[1], 'base64'))).toString('utf8').replace(/\0+$/, ''))
+			return await decryptAead(key, message)
 		} catch (error) {
+			// AEAD 认证失败会走到这里（密文被篡改 / 密钥不对）
 			this.logEvent('decryptServerMessage', error, 'error')
+			return ({})
 		}
-		return (decrypted)
 	}
 
 	// Encrypt a message for a client
 	// 加密发送给客户端的消息
-	encryptClientMessage(message, key) {
-		let encrypted = '';
+	async encryptClientMessage(message, key) {
 		try {
-			message = Buffer.from(JSON.stringify(message), 'utf8');
-			if ((message.length % 16) !== 0) {
-				message = Buffer.from([...message, ...Buffer.alloc(16 - (message.length % 16))])
-			}
-			const iv = Buffer.from(crypto.getRandomValues(new Uint8Array(12)));
-			const counter = Buffer.from(crypto.getRandomValues(new Uint8Array(4)));
-			const cipher = new chacha(key, iv, counter.reduce((a, b) => a * b));
-			encrypted = iv.toString('base64') + '|' + counter.toString('base64') + '|' + Buffer.from(cipher.encrypt(message)).toString('base64')
+			return await encryptAead(key, message)
 		} catch (error) {
 			this.logEvent('encryptClientMessage', error, 'error')
+			return ('')
 		}
-		return (encrypted)
 	}
 
 	// Decrypt a message from a client
 	// 解密来自客户端的消息
-	decryptClientMessage(message, key) {
-		let decrypted = {};
+	async decryptClientMessage(message, key) {
 		try {
-			const parts = message.split('|');
-			const decipher = new chacha(key, Buffer.from(parts[0], 'base64'), Buffer.from(parts[1], 'base64').reduce((a, b) => a * b));
-			decrypted = JSON.parse(Buffer.from(decipher.decrypt(Buffer.from(parts[2], 'base64'))).toString('utf8').replace(/\0+$/, ''))
+			return await decryptAead(key, message)
 		} catch (error) {
 			this.logEvent('decryptClientMessage', error, 'error')
+			return ({})
 		}
-		return (decrypted)
-	}
-
-	// XOR two hex strings
-	// 对两个十六进制字符串进行异或
-	xorHex(a, b) {
-		let result = '',
-			hexLength = Math.min(a.length, b.length);
-		for (let i = 0; i < hexLength; ++i) {
-			result += (parseInt(a.charAt(i), 16) ^ parseInt(b.charAt(i), 16)).toString(16)
-		}
-		return (result)
 	}
 
 	// Check if value is a string
@@ -611,11 +610,50 @@ class NodeCrypt {
 
 	// Handle server public key
 	// 处理服务器公钥
+	//
+	// 改造说明（原实现的问题）：
+	//   原来直接 localStorage.setItem(SERVER_KEY_STORAGE, serverKey)，
+	//   存了但从不比对 —— 等于没存。所以 README 声称的「防止中间人攻击」并未实现。
+	//
+	// 现在：存指纹 + 比对 + 变更时明确告知。但要说清楚它**只提供变更通知**：
+	//   服务端每 24 小时轮换一次 RSA 密钥，所以指纹变化是常态；
+	//   而且初次连接的指纹本身就是未认证的，无法证明「换成了对的」。
+	//   真正的保护是房间口令（见 aead.js 顶部）。
 	async handleServerKey(serverKey) {
 		this.logEvent('handleServerKey', 'Received server key');
-		localStorage.removeItem(this.SERVER_KEY_STORAGE);
-		localStorage.setItem(this.SERVER_KEY_STORAGE, serverKey);
-		this.config.rsaPublic = serverKey;
+		try {
+			const fingerprint = await keyFingerprint(serverKey);
+			let previous = null;
+			try {
+				previous = localStorage.getItem(this.SERVER_KEY_STORAGE);
+			} catch (error) {
+				// 隐私模式 / 禁用存储：降级为「本次会话内不比对」
+			}
+			this.serverKeyFingerprint = fingerprint;
+			this.serverKeyChanged = (previous !== null && previous !== fingerprint);
+			try {
+				localStorage.setItem(this.SERVER_KEY_STORAGE, fingerprint);
+			} catch (error) {}
+			this.config.rsaPublic = serverKey;
+			if (this.serverKeyChanged) {
+				this.logEvent('handleServerKey',
+					'服务端公钥指纹与上次不同：' + previous + ' -> ' + fingerprint +
+					'（可能是服务端轮换了密钥，也可能是中间人）。注意：这条提示只能说明「换了」，不能证明「换成了对的」。'
+				, 'error');
+			} else {
+				this.logEvent('handleServerKey', '服务端公钥指纹: ' + fingerprint);
+			}
+			if (this.callbacks.onServerKeyFingerprint) {
+				try {
+					this.callbacks.onServerKeyFingerprint(fingerprint, this.serverKeyChanged)
+				} catch (error) {
+					this.logEvent('handleServerKey-callback', error, 'error')
+				}
+			}
+		} catch (error) {
+			this.logEvent('handleServerKey', error, 'error');
+			return (false)
+		}
 		return true
 	}
 };

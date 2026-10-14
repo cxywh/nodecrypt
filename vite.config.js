@@ -47,9 +47,6 @@ export default defineConfig({
 				// 手动分块
 				manualChunks: (id) => {
 					if (id.includes('node_modules')) {
-						if (/aes-js|elliptic|js-chacha20|js-sha256/.test(id)) {
-							return 'crypto-libs'
-						}
 						return 'vendor-deps'
 					}
 					return undefined
@@ -71,9 +68,7 @@ export default defineConfig({
 	resolve: {
 		// Alias
 		// 别名
-		alias: {
-			buffer: 'buffer',
-		},
+		alias: {},
 	},
 	// Server options
 	// 服务器选项
@@ -90,6 +85,6 @@ export default defineConfig({
 	optimizeDeps: {
 		// Include
 		// 包含
-		include: ['buffer', 'aes-js', 'elliptic', 'js-chacha20', 'js-sha256', '@dicebear/core', '@dicebear/micah'],
+		include: ['@dicebear/core', '@dicebear/micah'],
 	},
 });
