@@ -48,6 +48,9 @@ class NodeCrypt {
 			onClientList: callbacks.onClientList || null,
 			onClientMessage: callbacks.onClientMessage || null,
 			onBinaryData: callbacks.onBinaryData || null,
+			// 新增：WebSocket 握手成功时回调。用来把「连服务器慢」和
+			// 「加密协商慢」区分开 —— 这两段在界面上该说不同的话。
+			onSocketOpen: callbacks.onSocketOpen || null,
 			// 新增：拿到服务端公钥指纹时回调（指纹, 是否与上次不同）
 			onServerKeyFingerprint: callbacks.onServerKeyFingerprint || null,
 		};
@@ -172,6 +175,7 @@ class NodeCrypt {
 		this.callbacks.onClientList = null;
 		this.callbacks.onClientMessage = null;
 		this.callbacks.onBinaryData = null;
+		this.callbacks.onSocketOpen = null;
 		this.callbacks.onServerKeyFingerprint = null;
 		this.serverKeys = null;
 		this.serverShared = null;
@@ -201,6 +205,15 @@ class NodeCrypt {
 	async onOpen() {
 		this.logEvent('onOpen');
 		this.startPing();
+		// 网络这一段到此结束。先通知出去，再去做耗时的密钥派生 ——
+		// PBKDF2 60 万次 + P-384 生成要占几十毫秒，顺序反了界面会白等一截。
+		if (this.callbacks.onSocketOpen) {
+			try {
+				this.callbacks.onSocketOpen()
+			} catch (error) {
+				this.logEvent('onSocketOpen-callback', error, 'error')
+			}
+		}
 		try {
 			// 房间标识：服务端只用它当不透明的房间桶名，不是安全边界
 			this.credentials.channelId = await sha256Hex('nodecrypt-v2|channel|' + this.credentials.channelName);
@@ -231,7 +244,10 @@ class NodeCrypt {
 		if (event.data === 'pong') {
 			return
 		}
-		this.logEvent('onMessage', event.data);
+		// 只记长度，不记内容：生产上 debug 一旦打开（或将来默认打开），
+		// 这一行会把每条收到的帧**完整**打进控制台 —— 单条可达数百 KB，
+		// 既刷屏又把用户数据落到日志里。
+		this.logEvent('onMessage', event.data.length + ' 字节');
 		try {
 			const data = JSON.parse(event.data);
 			if (data.type === 'server-key') {
@@ -285,7 +301,9 @@ class NodeCrypt {
 			return
 		}
 		const serverDecrypted = await this.decryptServerMessage(event.data, this.serverShared);
-		this.logEvent('onMessage-server-decrypted', serverDecrypted);
+		// 只记信封的动作字段，不记整个对象 —— 它是服务端信封的明文，
+		// 里面裹着要转发给对端的载荷。
+		this.logEvent('onMessage-server-decrypted', this.isObject(serverDecrypted) ? 'a=' + serverDecrypted.a : typeof serverDecrypted);
 		if (!this.isObject(serverDecrypted) || !this.isString(serverDecrypted.a)) {
 			return
 		}
@@ -378,7 +396,9 @@ class NodeCrypt {
 		}
 		if (serverDecrypted.a === 'c' && this.channel[serverDecrypted.c] && this.channel[serverDecrypted.c].shared) {
 			const clientDecrypted = await this.decryptClientMessage(serverDecrypted.p, this.channel[serverDecrypted.c].shared);
-			this.logEvent('onMessage-client-decrypted', clientDecrypted);
+			// ★ 这里是**用户聊天内容的明文**。绝不能进日志 ——
+			// debug 一开，用户说的每句话都会落在控制台里。
+			this.logEvent('onMessage-client-decrypted', this.isObject(clientDecrypted) ? 'a=' + clientDecrypted.a : typeof clientDecrypted);
 			if (!this.isObject(clientDecrypted) || !this.isString(clientDecrypted.a)) {
 				return
 			}

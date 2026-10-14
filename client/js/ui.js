@@ -453,10 +453,20 @@ export function loginFormHandler(modal) {
 			btn.innerText = t('ui.connecting', 'Connecting...')
 		}
 		window.joinRoom(userName, roomName, password, modal, function(success) {
-			if (!success && btn) {
-				btn.disabled = false;
-				btn.innerText = 'ENTER'
+			if (!success) {
+				// 失败原因已经在按钮下方那行状态里显示出来了（含秒数），
+				// 这里只负责把按钮恢复成可点 —— 用户不用刷新页面就能重试。
+				if (btn) {
+					btn.disabled = false;
+					btn.innerText = t('ui.enter', 'ENTER')
+				}
+				return
 			}
+			if (btn) {
+				btn.disabled = false;
+				btn.innerText = t('ui.enter', 'ENTER')
+			}
+			setConnectStatus(null)
 		})
 	}
 }
@@ -478,7 +488,46 @@ export function generateLoginForm(isModal = false) {
 			<label for="password${idPrefix}" class="floating-label">${t('ui.node_password', 'Room Password')} <span class="optional">${t('ui.optional', '(optional)')}</span></label>
 		</div>
 		<button type="submit" class="login-btn">${t('ui.enter', 'ENTER')}</button>
+		<div class="connect-status" id="connectStatus${idPrefix}" role="status" aria-live="polite" hidden></div>
 	`;
+}
+
+const CONNECT_STAGE_TEXT = {
+	net: ['ui.connect_server', 'Connecting to server'],
+	crypto: ['ui.connect_crypto', 'Connected. Negotiating encryption']
+};
+
+/**
+ * 渲染连接过程的状态。
+ *
+ * 为什么必须带秒数：实测国内到 Cloudflare 的 wss 握手在 0.5~10 秒之间抖动，
+ * 静态的「连接中...」无法区分「正在连」和「已经卡死」。一个持续变大的数字
+ * 是「还活着」最直接的证据。
+ *
+ * 主页表单和弹窗表单可能同时存在，两个都更新。
+ */
+export function setConnectStatus(state) {
+	for (const el of document.querySelectorAll('.connect-status')) {
+		if (!state || !state.stage || state.stage === 'ready') {
+			el.textContent = '';
+			el.className = 'connect-status';
+			el.hidden = true;
+			continue;
+		}
+		el.hidden = false;
+		if (state.stage === 'failed') {
+			const reason = state.error === 'timeout'
+				? t('ui.connect_timeout', 'Timed out')
+				: t('ui.connect_failed', 'Connection failed');
+			el.className = 'connect-status connect-status-failed';
+			el.textContent = `${reason} · ${state.seconds}s · ${t('ui.connect_retry', 'Please retry')}`;
+			continue;
+		}
+		const [key, fallback] = CONNECT_STAGE_TEXT[state.stage] || CONNECT_STAGE_TEXT.net;
+		const slow = state.slow ? ` · ${t('ui.connect_slow', 'Slow network, still trying')}` : '';
+		el.className = 'connect-status' + (state.slow ? ' connect-status-slow' : '');
+		el.textContent = `${t(key, fallback)} · ${state.seconds}s${slow}`;
+	}
 }
 export function openLoginModal() {
 	const modal = document.createElement('div');

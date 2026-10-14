@@ -11,8 +11,13 @@ import {
 } from './chat.js';
 import {
 	renderMainHeader,
-	renderUserList
+	renderUserList,
+	setConnectStatus
 } from './ui.js';
+import {
+	ConnectStatus,
+	STAGE
+} from './util.connect.js';
 import {
 	escapeHTML
 } from './util.string.js';
@@ -105,28 +110,68 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 	const sidebarUsername = $id('sidebar-username');
 	if (sidebarUsername) sidebarUsername.textContent = userName;
 	setSidebarAvatar(userName);
-	let closed = false;
+	// 连接过程的可见反馈。带秒数是关键 —— 实测这条链路握手 0.5~10 秒抖动，
+	// 静态的「连接中...」无法区分「正在连」和「已经卡死」。
+	const status = new ConnectStatus({
+		onRender: (state) => setConnectStatus(state),
+		// 超时也要让按钮恢复可点，否则用户只能刷新页面。
+		onTimeout: () => settle(false)
+	});
+	// 单次收尾。这是这次改动最关键的一处：
+	//
+	// 原来 onServerClosed 的第一行是 setStatus('Node connection closed')，
+	// 而这个函数在整个项目里**只有调用、没有定义**。它抛出的 ReferenceError
+	// 被 NodeCrypt 的 try/catch 吞掉（只在 debug 日志里留一行），
+	// 于是紧随其后的 onResult(false) 永远执行不到 ——
+	// 连接失败时按钮永远停在「连接中...」，用户看不到任何错误，只能刷新页面。
+	//
+	// 现在收尾不依赖任何可能抛错的调用，而且幂等：
+	// NodeCrypt 的 onError 和 onClose 会先后都调 onServerClosed。
+	let settled = false;
+	function settle(ok) {
+		if (settled) {
+			return
+		}
+		settled = true;
+		status.stop();
+		if (!onResult) {
+			return
+		}
+		try {
+			onResult(ok)
+		} catch (error) {
+			// 回调里抛错不该让连接状态卡住，但必须可见。
+			console.error('joinRoom onResult failed:', error)
+		}
+	}
 	const callbacks = {
-		onServerClosed: () => {
-			setStatus('Node connection closed');
-			if (onResult && !closed) {
-				closed = true;
-				onResult(false)
+		// WebSocket 握手成功 —— 网络这一段结束，接下来是密钥协商。
+		// 分开报是为了让用户知道慢在哪一段。
+		onSocketOpen: () => status.advance(STAGE.CRYPTO),
+		onServerClosed: (reason) => {
+			if (settled) {
+				// 连上之后才断线。这时登录表单已经隐藏，改状态行用户也看不见 ——
+				// 该说的是聊天区里的一句话。
+				if (status.stage === STAGE.READY) {
+					status.stop();
+					addSystemMsg(t('system.disconnected', 'disconnected from server'))
+				}
+				return
 			}
-		},		onServerSecured: () => {
-			if (modal) modal.remove();
-			else {
+			status.fail(reason || 'closed');
+			settle(false)
+		},
+		onServerSecured: () => {
+			status.finish();
+			if (modal) {
+				modal.remove()
+			} else {
 				const loginContainer = $id('login-container');
 				if (loginContainer) loginContainer.style.display = 'none';
 				const chatContainer = $id('chat-container');
 				if (chatContainer) chatContainer.style.display = '';
-				
-
 			}
-			if (onResult && !closed) {
-				closed = true;
-				onResult(true)
-			}
+			settle(true);
 			addSystemMsg(t('system.secured', 'connection secured'))
 		},
 		onClientSecured: (user) => handleClientSecured(idx, user),
@@ -138,6 +183,7 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 		//   因为 NodeCrypt 的 callbacks 里没有发送类回调。）
 		onBinaryData: (record) => window.handleBinaryVolume?.(record)
 	};
+	status.start();
 	const chatInst = new window.NodeCrypt(window.config, callbacks);
 	chatInst.setCredentials(userName, roomName, password);
 	chatInst.connect();

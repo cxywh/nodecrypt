@@ -251,6 +251,67 @@ body {
 	transform: translateY(1px);
 }
 
+/* 连接状态行：阶段 + 已等待秒数。
+   秒数是这里的重点 —— 实测国内到 Cloudflare 的 wss 握手在 0.5~10 秒之间抖动，
+   只有一句静态的「连接中...」无法区分「正在连」和「已经卡死」。 */
+.connect-status {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	margin-top: 12px;
+	min-height: 1.2em;
+	font-size: 0.82rem;
+	line-height: 1.4;
+	color: #8a8f98;
+	text-align: center;
+	transition: color 0.2s ease;
+}
+
+/* 必须显式处理 [hidden]：上面的 display:flex 会覆盖浏览器默认的
+   [hidden]{display:none}，否则页面一打开就会多出一条空白状态行（还带小圆点）。 */
+.connect-status[hidden] {
+	display: none;
+}
+
+/* 小圆点是 CSS 画的，不是 emoji：随状态变色，等待期间呼吸。 */
+.connect-status::before {
+	content: '';
+	flex: 0 0 auto;
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: currentColor;
+	animation: connect-pulse 1.2s ease-in-out infinite;
+}
+
+/* 网络慢时转琥珀色。文案说的是「仍在尝试」而不是「请检查网络」——
+   实测这条链路本来就慢，一上来就怪用户的网络是错的。 */
+.connect-status-slow {
+	color: #d18f1a;
+}
+
+.connect-status-failed {
+	color: #e74c3c;
+}
+
+/* 失败是终态，圆点不该继续呼吸 */
+.connect-status-failed::before {
+	animation: none;
+}
+
+@keyframes connect-pulse {
+	0%, 100% { opacity: 0.35; }
+	50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.connect-status::before {
+		animation: none;
+		opacity: 0.7;
+	}
+}
+
 .login-modal {
 	position: fixed;
 	z-index: 9999;

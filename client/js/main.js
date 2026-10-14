@@ -86,7 +86,11 @@ import {	renderUserList,       // 渲染用户列表 / Render user list
 window.config = {
 	wsAddress: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`, // WebSocket 服务器地址 / WebSocket server address
 	//wsAddress: `wss://crypt.works`,
-	debug: true                       // 是否开启调试模式 / Enable debug mode
+	// 生产环境关掉 debug：开着的话 NodeCrypt 会把每条收到的帧打进控制台，
+	// 单条可达数百 KB，既刷屏（用户明确要求日志干净）又把用户数据落到控制台日志里。
+	// 需要排查时在地址栏加 ?debug=1；本地开发自动打开。
+	debug: new URLSearchParams(window.location.search).has('debug') ||
+		/^(localhost|127\.0\.0\.1|\[::1\])$/.test(window.location.hostname)
 };
 
 // 在文档开始加载前就初始化语言设置，防止闪烁
