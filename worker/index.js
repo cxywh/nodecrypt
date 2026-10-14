@@ -6,10 +6,31 @@ const PROTOCOL_VERSION = 'NC2';
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const upgradeHeader = request.headers.get('Upgrade');
+    const isWebSocket = upgradeHeader === 'websocket';
+
+    // http -> https 强制跳转。
+    //
+    // 为什么必须做：加密层依赖 crypto.subtle，而它只在「安全上下文」可用。
+    // 用 http:// 打开时页面能正常渲染，但 crypto.subtle === undefined，
+    // 表现是「页面好好的、一发消息就报错」——极难排查，所以在这里堵死。
+    //
+    // 两点排除：
+    //   · WebSocket 升级请求不跳（ws 客户端不跟随 301，会把握手直接打断）。
+    //     页面被跳转到 https 之后，客户端自然改用 wss://。
+    //   · 本地开发不跳（wrangler dev 在 http://127.0.0.1:8787 上跑）。
+    const isLocalHost = url.hostname === 'localhost'
+      || url.hostname === '127.0.0.1'
+      || url.hostname === '[::1]';
+    const scheme = request.headers.get('X-Forwarded-Proto')
+      || url.protocol.replace(':', '');
+    if (!isWebSocket && !isLocalHost && scheme === 'http') {
+      url.protocol = 'https:';
+      return Response.redirect(url.toString(), 301);
+    }
 
     // 处理WebSocket请求
-    const upgradeHeader = request.headers.get('Upgrade');
-    if (upgradeHeader && upgradeHeader === 'websocket') {
+    if (isWebSocket) {
       const id = env.CHAT_ROOM.idFromName('chat-room');
       const stub = env.CHAT_ROOM.get(id);
       return stub.fetch(request);
