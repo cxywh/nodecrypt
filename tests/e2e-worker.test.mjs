@@ -12,7 +12,8 @@
 
 import * as c from '../client/js/aead.js';
 import {
-	uploadToR2, downloadFromR2, newFileKey, exportFileKey, importFileKey, decryptChunk
+	uploadToR2, downloadFromR2, newFileKey, exportFileKey, importFileKey, decryptChunk,
+	isR2Available, __resetR2Probe
 } from '../client/js/util.blob.js';
 
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:8787/';
@@ -65,7 +66,7 @@ class TestClient {
 		this.ready = new Promise((res) => { this._resolveReady = res; });
 	}
 
-	async connect() {
+	async connect(attempt = 1) {
 		this.ws = new WebSocket(WS_URL);
 		// 串行化消息处理：a:'c' 帧既可能是对端公钥、也可能是业务密文，
 		// 代码靠 peer.shared 区分。并发处理会让后启动的 handler 看到 shared
@@ -77,10 +78,25 @@ class TestClient {
 				.catch((e) => this.errors.push(String(e && e.message ? e.message : e)));
 		});
 		this.ws.addEventListener('error', () => this.errors.push('ws error'));
-		await new Promise((res, rej) => {
-			this.ws.addEventListener('open', res);
-			setTimeout(() => rej(new Error('连接超时: ' + WS_URL)), 15000);
-		});
+		try {
+			await new Promise((res, rej) => {
+				this.ws.addEventListener('open', res);
+				// 实测国内到 Cloudflare 的 wss 握手在 0.5~10 秒之间大幅抖动
+				// （本机对照 8 毫秒），并发连接本身没问题（5/5 稳定保活），
+				// 纯粹是链路延迟。所以超时给足 60 秒。
+				setTimeout(() => rej(new Error('连接超时: ' + WS_URL)), 60000);
+			});
+		} catch (error) {
+			// 抖动导致建连失败时重试 —— 本测试要验的是协议正确性，
+			// 不该被链路的一次停顿判成失败而掩盖真实问题。
+			try { this.ws.close(); } catch {}
+			if (attempt < 3) {
+				console.log(`      （建连失败，第 ${attempt} 次重试）`);
+				await new Promise(r => setTimeout(r, 1500));
+				return this.connect(attempt + 1);
+			}
+			throw error;
+		}
 		// 客户端首帧：版本前缀 + P-384 公钥
 		this.keys = await c.generateEcdhKeyPair('P-384');
 		this.ws.send(PROTO + '|' + await c.exportEcdhPublic(this.keys));
@@ -259,6 +275,16 @@ try {
 	// -----------------------------------------------------------------------
 	console.log('\n[5] R2 大文件：密文走存储，密钥走 E2EE 通道');
 
+	// R2 需要在控制台绑定支付方式才能启用。没启用时这一段整体跳过 ——
+	// 报「失败」是错的：代码路径本身走的就是降级（大文件退回中继），
+	// 跳过并说明原因，才不会被误读成 bug。
+	__resetR2Probe();
+	const r2Up = await isR2Available();
+	if (!r2Up) {
+		console.log('  ⊘ 跳过：R2 未启用（/blob/* 返回 503），大文件当前走中继降级路径');
+		console.log('          启用步骤见 wrangler.toml 里的说明；前端降级行为由 frontend-r2 覆盖');
+	} else {
+
 	const fileBytes = randomBytes(6 * 1024 * 1024);   // 跨 2 块（块大小 4 MiB）
 	const file = new File([fileBytes], '大文件 测试.bin', { type: 'application/octet-stream' });
 
@@ -332,6 +358,8 @@ try {
 		}
 		check('篡改密文后解密失败（AEAD 认证生效）', tamperFailed);
 	}
+
+	}   // end: else (R2 可用)
 
 	alice.ws.close();
 	bob.ws.close();

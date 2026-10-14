@@ -1,0 +1,48 @@
+# 仅本机开发用 —— 在 wrangler.toml 的基础上补一个【本地】R2 绑定。
+#
+# 为什么需要单独一份：
+#   Cloudflare 账户还没开通 R2（要绑支付方式，暂时没有可用的卡），所以生产部署
+#   不能带 [[r2_buckets]] —— 桶不存在时 wrangler deploy 会直接失败，报
+#   code 10085 "R2 bucket not found"。但 wrangler dev 用的是 miniflare 的**本地**
+#   R2 模拟器，凭空造一个同名桶，完全不需要账户开通。
+#
+#   于是：wrangler.toml 保持「能部署」，这份配置用来「能本地测 R2 代码路径」。
+#
+# 用法：
+#   npx wrangler dev --config wrangler.local.toml --port 8787
+#
+# 注意：不带 --config 直接跑 wrangler dev 会读 wrangler.toml（没有 R2 绑定），
+# 此时 /blob/* 返回 503，客户端会自动降级到中继路径 —— 那是**生产行为**，
+# 想测 R2 就得用这份配置。
+#
+# 等账户开通 R2 之后：把 wrangler.toml 里的 [[r2_buckets]] 取消注释，
+# 然后本文件就可以删掉了。
+
+name = "nodecrypt"
+main = "worker/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist"
+not_found_handling = "single-page-application"
+run_worker_first = true
+binding = "ASSETS"
+
+[durable_objects]
+bindings = [
+  { name = "CHAT_ROOM", class_name = "ChatRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatRoom"]
+
+# 本地 R2 模拟器（miniflare 自建，不碰账户）
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "nodecrypt-files"
+
+[[routes]]
+pattern = "chat.cxywh.cn"
+custom_domain = true

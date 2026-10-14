@@ -2,7 +2,7 @@
 // 导入必要的模块
 import { deflate, inflate } from 'fflate';
 import { showFileUploadModal } from './util.fileUpload.js';
-import { uploadToR2, downloadFromR2, saveBlob, saveManifest, loadManifest, R2_THRESHOLD } from './util.blob.js';
+import { uploadToR2, downloadFromR2, saveBlob, saveManifest, loadManifest, isR2Available, R2_THRESHOLD } from './util.blob.js';
 
 // 分卷大小统一配置
 const DEFAULT_VOLUME_SIZE = 256 * 1024; // 512KB
@@ -380,8 +380,12 @@ async function handleFilesUpload(files, onSend) {
 
 	// 分流：小文件走原来的 WebSocket 中继（少两个来回、不留任何存储），
 	// 大文件走 R2（上行与人数解耦、支持断点续传、不占内存）。
+	//
+	// R2 没启用时（未绑定支付方式）阈值当作无穷大，全部走中继 —— 功能完整可用，
+	// 只是大文件更耗流量。这样代码可以先上线，等开通 R2 后无需改动自动切换。
 	const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-	if (totalBytes >= R2_THRESHOLD) {
+	const threshold = (await isR2Available()) ? R2_THRESHOLD : Infinity;
+	if (totalBytes >= threshold) {
 		await uploadFilesViaR2(files, onSend);
 		return;
 	}

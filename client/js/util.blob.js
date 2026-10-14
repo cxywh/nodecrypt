@@ -36,6 +36,35 @@ const MAX_RETRY = 3;
 /** 超过这个大小才走 R2。更小的走中继更划算：少两个来回，且不留任何存储。 */
 export const R2_THRESHOLD = 1024 * 1024;
 
+// R2 是否可用 —— 只探测一次，之后缓存。
+//
+// 为什么需要：R2 需要在 Cloudflare 控制台绑定支付方式才能启用（免费额度也要绑卡）。
+// 没启用时 Worker 上的 FILES 绑定不存在，/blob/* 一律返回 503。
+// 如果不探这一下，每个大文件都会先传一遍再撞 503 —— 白等一轮，报错还让人以为坏了。
+// 探测结果的用法是：不可用时把阈值当作无穷大，全部退回原来的中继路径，
+// 功能保持完整（大文件能传，只是更耗流量）；哪天开通了 R2，代码自己就切过去了。
+let r2Probe = null;
+
+export function isR2Available() {
+	if (r2Probe) return r2Probe;
+	r2Probe = (async () => {
+		try {
+			// 用全 0 的合法 blobId 探 —— 格式合法所以不会被 400 挡掉，
+			// 能直接看出是「R2 在、对象不存在」(404) 还是「R2 没启用」(503)
+			const response = await fetch(`/blob/${'0'.repeat(64)}/0`, { method: 'HEAD' });
+			return response.status !== 503;
+		} catch {
+			return false;
+		}
+	})();
+	return r2Probe;
+}
+
+/** 测试用：重置探测缓存 */
+export function __resetR2Probe() {
+	r2Probe = null;
+}
+
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
 

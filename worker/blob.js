@@ -26,19 +26,24 @@ const INDEX_RE = /^\d{1,6}$/;
 export async function handleBlob(request, env, url) {
   if (!url.pathname.startsWith('/blob/')) return null;
 
-  // 绑定没配好时给出明确诊断，而不是 500 "undefined is not an object"
-  if (!env.FILES) {
-    return jsonErr('R2 binding "FILES" is not configured', 503);
-  }
-
   const parts = url.pathname.split('/').filter(Boolean);   // ['blob', blobId, index]
   if (parts.length !== 3) return jsonErr('bad path', 400);
 
   const [, blobId, index] = parts;
   // 严格校验：blobId 必须是 64 位小写 hex。不合法就直接拒，绝不把用户输入
   // 拼进对象名 —— 否则 `../` 之类有可能越界到别的键空间。
+  //
+  // 放在绑定检查**之前**：拒绝垃圾输入不该依赖环境，同一个请求在有没有 R2 的
+  // 部署上都该得到同样的 400，而不是一处 400、另一处 503。
   if (!BLOB_ID_RE.test(blobId) || !INDEX_RE.test(index)) {
     return jsonErr('bad path', 400);
+  }
+
+  // 绑定没配好时给出明确诊断，而不是 500 "undefined is not an object"。
+  // R2 需要在控制台绑定支付方式才能启用，所以生产上这里很可能就是 503 ——
+  // 客户端 isR2Available() 正是靠这个 503 判定「走降级路径」。
+  if (!env.FILES) {
+    return jsonErr('R2 binding "FILES" is not configured', 503);
   }
 
   const objectKey = `${blobId}/${index}`;

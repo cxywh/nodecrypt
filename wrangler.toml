@@ -25,12 +25,26 @@ new_sqlite_classes = ["ChatRoom"]
 # 对象名只含随机 blobId + 块号，不含文件名、不含任何用户信息 —— 服务端无法把
 # 对象关联到人，也解不开。
 #
-# ⚠️ 需要在 Cloudflare 控制台先开通 R2（R2 免费额度要绑定支付方式）：
-#    控制台 → R2 → Enable R2，然后 npx wrangler r2 bucket create nodecrypt-files
-#    wrangler dev 自带本地 R2 模拟器，所以本机开发调试不依赖这一步。
-[[r2_buckets]]
-binding = "FILES"
-bucket_name = "nodecrypt-files"
+# ⚠️ 当前**故意注释掉**。
+#
+# 原因：R2 必须先在 Cloudflare 控制台绑定支付方式才能启用（免费额度也要绑卡）。
+# 桶不存在时部署会直接失败： code 10085 "R2 bucket not found"。
+#
+# 代码侧已经能自动适应这种情况 —— client/js/util.blob.js 的 isR2Available() 会在
+# 启动时 HEAD 一次 /blob/<合法blobId>/0：
+#     · 503  = 绑定缺失   -> 阈值当作无穷大，大文件全部退回 WebSocket 中继
+#     · 404  = R2 在但对象不存在 -> 阈值 1 MiB，大文件走 R2
+# 所以注释掉这一段不影响功能，只是大文件更耗流量。
+#
+# 拿到可用的卡之后，三步切回 R2（无需改任何代码）：
+#   1. 控制台 -> 存储和数据库 -> R2 -> 概览 -> 完成结账流程（会有一笔 $5 预授权
+#      冻结，不是扣费，银行会自动释放）
+#   2. npx wrangler r2 bucket create nodecrypt-files
+#   3. 取消下面两行的注释，再 npx wrangler deploy
+#
+# [[r2_buckets]]
+# binding = "FILES"
+# bucket_name = "nodecrypt-files"
 
 # 自定义域：把 chat.cxywh.cn 绑到这个 Worker
 #

@@ -234,6 +234,58 @@ await check('小文件仍走中继（保持原行为）', async () => {
 	assert(!sent.some(m => m.type === 'file_offer'), '小文件不该走 R2');
 });
 
+await check('R2 可用性探测返回布尔值且被缓存（只发一次请求）', async () => {
+	const { isR2Available, __resetR2Probe } = await import('../client/js/util.blob.js');
+	__resetR2Probe();   // 前面第 1 节已经探过一次，这里要先清掉缓存才数得准
+	let probeCalls = 0;
+	const origFetch = globalThis.fetch;
+	globalThis.fetch = (url, opts) => {
+		if (opts && opts.method === 'HEAD' && String(url).includes('/blob/')) probeCalls++;
+		return origFetch(url, opts);
+	};
+	const [a, b, c] = await Promise.all([isR2Available(), isR2Available(), isR2Available()]);
+	globalThis.fetch = origFetch;
+	assertEq(typeof a, 'boolean', '应当返回布尔值');
+	assertEq(a, b, '并发调用结果应当一致');
+	assertEq(b, c, '并发调用结果应当一致');
+	assertEq(probeCalls, 1, `探测请求应当只发一次（实际 ${probeCalls}）`);
+});
+
+// ---------------------------------------------------------------------------
+console.log('\n【1.5】R2 不可用时的降级（没有境外卡的实际情况）');
+
+await check('R2 不可用时大文件自动退回中继，不撞 503', async () => {
+	const { isR2Available: probe, __resetR2Probe } = await import('../client/js/util.blob.js');
+	const origFetch = globalThis.fetch;
+
+	// 模拟 Worker 上没有 FILES 绑定时的响应
+	globalThis.fetch = (url, opts) => {
+		if (opts && opts.method === 'HEAD' && String(url).includes('/blob/')) {
+			return Promise.resolve(new Response(null, { status: 503 }));
+		}
+		return origFetch(url, opts);
+	};
+
+	__resetR2Probe();
+	assertEq(await probe(), false, '应当判定 R2 不可用');
+
+	sent.length = 0;
+	await __feedFiles([new File([randomBytes(3 * 1024 * 1024)], 'big-relay.bin')]);
+	globalThis.fetch = origFetch;
+
+	assert(sent.some(m => m.type === 'file_start'), 'R2 不可用时大文件应该走中继');
+	assert(!sent.some(m => m.type === 'file_offer'), 'R2 不可用时不该发 file_offer');
+});
+
+await check('R2 恢复可用后自动切回 R2（无需改代码）', async () => {
+	const { __resetR2Probe } = await import('../client/js/util.blob.js');
+	__resetR2Probe();
+	sent.length = 0;
+	await __feedFiles([new File([randomBytes(3 * 1024 * 1024)], 'big-r2.bin')]);
+	assert(sent.some(m => m.type === 'file_offer'), 'R2 可用时大文件应该走 R2');
+	assert(!sent.some(m => m.type === 'file_start'), 'R2 可用时不该退化成中继');
+});
+
 // ---------------------------------------------------------------------------
 console.log('\n【2】接收路径：file_offer -> 卡片 -> 下载解密');
 
