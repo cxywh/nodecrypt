@@ -97,6 +97,7 @@ updateStaticTexts();
 // Expose functions to the global window object for accessibility
 window.addSystemMsg = addSystemMsg;
 window.addOtherMsg = addOtherMsg;
+window.addMsg = addMsg;
 window.joinRoom = joinRoom;
 window.notifyMessage = notifyMessage;
 window.setupEmojiPicker = setupEmojiPicker;

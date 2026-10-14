@@ -11,8 +11,33 @@
 // 前置： 另开终端 npx wrangler dev --port 8787
 
 import * as c from '../client/js/aead.js';
+import {
+	uploadToR2, downloadFromR2, newFileKey, exportFileKey, importFileKey, decryptChunk
+} from '../client/js/util.blob.js';
 
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:8787/';
+
+// util.blob.js 用的是相对路径 /blob/...，Node 的 fetch 解析不了，补上基址。
+// （WS 握手走 WebSocket，不受影响）
+const HTTP_BASE = process.env.BASE_URL
+	|| WS_URL.replace(/^ws/, 'http').replace(/\/$/, '');
+const realFetch = globalThis.fetch;
+globalThis.fetch = (url, opts) =>
+	realFetch(typeof url === 'string' && url.startsWith('/') ? HTTP_BASE + url : url, opts);
+
+function randomBytes(n) {
+	const b = new Uint8Array(n);
+	for (let i = 0; i < n; i += 65536) {
+		crypto.getRandomValues(b.subarray(i, Math.min(i + 65536, n)));
+	}
+	return b;
+}
+
+function sameBytes(a, b) {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
 const PROTO = c.PROTOCOL_VERSION;
 const ROOM = 'e2e-' + Math.random().toString(36).slice(2, 10);
 const PASSWORD = 'e2e-test-password';
@@ -224,6 +249,89 @@ try {
 
 	check('全程无异常', alice.errors.length === 0 && bob.errors.length === 0,
 		[...alice.errors, ...bob.errors].join(' | '));
+
+	// -----------------------------------------------------------------------
+	// R2 大文件：安全关键路径
+	//
+	// 这里验的是整个 P1 后半段的核心不变式 ——
+	//   密文走 R2（公开存储），密钥走既有的端到端加密通道（只有房间成员能解）。
+	// 所以除了「能不能传」，更要验「**没有密钥的人拿到 blobId 也读不出任何东西**」。
+	// -----------------------------------------------------------------------
+	console.log('\n[5] R2 大文件：密文走存储，密钥走 E2EE 通道');
+
+	const fileBytes = randomBytes(6 * 1024 * 1024);   // 跨 2 块（块大小 4 MiB）
+	const file = new File([fileBytes], '大文件 测试.bin', { type: 'application/octet-stream' });
+
+	const manifest = await uploadToR2(file);
+	check('本地分块加密并直传 R2', manifest.total === 2,
+		`${manifest.total} 块 / 明文 ${manifest.size} 字节`);
+
+	// 清单（含解密密钥）走和 text 消息完全相同的通道。
+	// 字段与 util.file.js 的 uploadFilesViaR2 发出的 file_offer 完全一致 ——
+	// 这里刻意逐字段写死而不用 ...manifest，这样任何一方改了字段名都会被立刻抓住。
+	await alice.broadcast('file_offer', {
+		type: 'file_offer',
+		fileId: 'r2-test-1',
+		blobId: manifest.blobId,
+		key: manifest.key,
+		fileName: manifest.fileName,
+		originalSize: manifest.size,
+		total: manifest.total,
+		chunkSize: manifest.chunkSize,
+		mime: manifest.mime
+	});
+
+	const offer = await bob.waitFor(() => bob.messages.find(m => m.t === 'file_offer'), 20000);
+	check('Bob 收到 file_offer（密钥经 E2EE 通道送达）', !!offer,
+		offer ? `来自 ${offer.from}` : '(无)');
+
+	if (offer) {
+		const m = offer.d;
+		// 逐字段校验协议契约（含命名）
+		check('清单字段完整且命名符合协议', !!(m.blobId && m.key && m.fileName && m.total && m.chunkSize && m.mime),
+			`blobId=${String(m.blobId).slice(0, 12)}… total=${m.total} 文件名=${m.fileName}`);
+		check('blobId 是 64 位小写 hex（R2 端点的强制格式）',
+			/^[0-9a-f]{64}$/.test(String(m.blobId)), String(m.blobId).slice(0, 16) + '…');
+
+		const blob = await downloadFromR2({
+			blobId: m.blobId, key: m.key, name: m.fileName, mime: m.mime,
+			size: m.size, total: m.total, chunkSize: m.chunkSize
+		});
+		const got = new Uint8Array(await blob.arrayBuffer());
+		check('Bob 从 R2 下载并解密，内容逐字节一致', sameBytes(got, fileBytes),
+			`${got.length} 字节`);
+
+		// 关键安全断言：只有 blobId、没有密钥的攻击者
+		console.log('\n[6] 安全性质：没有密钥就拿不到内容');
+		const rawCipher = new Uint8Array(
+			await (await fetch(`/blob/${m.blobId}/0`)).arrayBuffer()
+		);
+		check('R2 上的对象确实是密文（与明文前 1 MiB 不重合）',
+			!sameBytes(rawCipher.subarray(0, 1024 * 1024), fileBytes.subarray(0, 1024 * 1024)));
+
+		let wrongKeyFailed = false;
+		try {
+			// 换一把全新的随机密钥 —— 模拟「只拿到 blobId、没有正确密钥」的人
+			const bogusKey = await exportFileKey(await newFileKey());
+			await downloadFromR2({
+				blobId: m.blobId, key: bogusKey, name: 'x', mime: 'x',
+				size: m.size, total: m.total, chunkSize: m.chunkSize
+			});
+		} catch {
+			wrongKeyFailed = true;
+		}
+		check('用错误的密钥解密必然失败（不是安静返回垃圾）', wrongKeyFailed);
+
+		let tamperFailed = false;
+		try {
+			const tampered = new Uint8Array(rawCipher);
+			tampered[tampered.length - 1] ^= 0x01;
+			await decryptChunk(await importFileKey(m.key), m.blobId, 0, m.total, tampered);
+		} catch {
+			tamperFailed = true;
+		}
+		check('篡改密文后解密失败（AEAD 认证生效）', tamperFailed);
+	}
 
 	alice.ws.close();
 	bob.ws.close();

@@ -2,6 +2,7 @@
 // 导入必要的模块
 import { deflate, inflate } from 'fflate';
 import { showFileUploadModal } from './util.fileUpload.js';
+import { uploadToR2, downloadFromR2, saveBlob, saveManifest, loadManifest, R2_THRESHOLD } from './util.blob.js';
 
 // 分卷大小统一配置
 const DEFAULT_VOLUME_SIZE = 256 * 1024; // 512KB
@@ -376,7 +377,15 @@ export function setupFileSend({
 // 处理文件上传
 async function handleFilesUpload(files, onSend) {
 	if (!files || files.length === 0) return;
-	
+
+	// 分流：小文件走原来的 WebSocket 中继（少两个来回、不留任何存储），
+	// 大文件走 R2（上行与人数解耦、支持断点续传、不占内存）。
+	const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+	if (totalBytes >= R2_THRESHOLD) {
+		await uploadFilesViaR2(files, onSend);
+		return;
+	}
+
 	const fileId = generateFileId();
 	
 	try {
@@ -480,6 +489,79 @@ async function handleFilesUpload(files, onSend) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// R2 路径：大文件
+// ---------------------------------------------------------------------------
+
+/**
+ * 把文件分块加密直传 R2，然后把「清单」通过端到端加密通道发出去。
+ *
+ * 顺序很重要：**先传完，再发清单**。反过来的话对端可能在密文还没就位时就去下载，
+ * 拿到 404 或半截数据。清单里带解密密钥，所以它只能走既有的 E2EE 通道，
+ * 绝不能出现在 URL、日志或 R2 上。
+ *
+ * 多个文件时逐个独立上传、各自发一份清单 —— 不打包成归档。这样每个文件能独立
+ * 下载、独立续传、独立重试，坏一个不影响其余。
+ */
+async function uploadFilesViaR2(files, onSend) {
+	for (const file of files) {
+		const fileId = generateFileId();
+
+		const transfer = {
+			kind: 'r2',
+			isR2: true,
+			fileId,
+			fileName: file.name,
+			originalSize: file.size,
+			uploaded: 0,
+			status: 'uploading',
+			isSender: true
+		};
+		window.fileTransfers.set(fileId, transfer);
+
+		// 发送方自己的卡片：本地直接渲染，不经过中继（别人不需要知道你在传）
+		if (window.addMsg) {
+			window.addMsg({ type: 'file', fileId, fileName: file.name, originalSize: file.size, isR2: true }, false, 'file');
+		}
+
+		try {
+			const manifest = await uploadToR2(file, {
+				onProgress: (p) => {
+					transfer.uploaded = p.uploaded;
+					updateFileProgress(fileId);
+				}
+			});
+
+			transfer.status = 'ready';
+			updateFileProgress(fileId);
+
+			onSend({
+				type: 'file_offer',
+				fileId,
+				blobId: manifest.blobId,
+				// 唯一需要保密的东西：只有房间成员能解出它
+				key: manifest.key,
+				fileName: manifest.fileName,
+				originalSize: manifest.size,
+				total: manifest.total,
+				chunkSize: manifest.chunkSize,
+				mime: manifest.mime
+			});
+
+			transfer.status = 'completed';
+			updateFileProgress(fileId);
+
+		} catch (error) {
+			transfer.status = 'failed';
+			transfer.error = error.message;
+			updateFileProgress(fileId);
+			if (window.addSystemMsg) {
+				window.addSystemMsg(`上传失败：${file.name} — ${error.message}`);
+			}
+		}
+	}
+}
+
 // Send volumes with progress tracking
 // 发送分卷并跟踪进度
 async function sendVolumes(fileId, volumes, onSend, updateProgress, fileName) {
@@ -547,7 +629,10 @@ function updateFileProgress(fileId) {
 		const downloadBtn = element.querySelector('.file-download-btn');
 		
 		// 判断是否为发送方（发送方没有volumeData）
-		const isSender = !transfer.volumeData || transfer.volumeData.length === 0;
+		// R2 传输两条路径都没有 volumeData，所以不能靠它判断 —— 用显式的 isSender。
+		const isSender = transfer.isSender !== undefined
+			? transfer.isSender
+			: (!transfer.volumeData || transfer.volumeData.length === 0);
 		
 		if (transfer.status === 'sending') {
 			const progress = (transfer.sentVolumes / transfer.totalVolumes) * 100;
@@ -569,6 +654,58 @@ function updateFileProgress(fileId) {
 			}
 			if (progressBar) progressBar.style.width = `${progress}%`;
 			if (statusText) statusText.textContent = `Receiving ${transfer.receivedVolumes.size}/${transfer.totalVolumes}`;
+			if (downloadBtn) {
+				downloadBtn.classList.remove('show', 'animate-in');
+				downloadBtn.style.display = 'none';
+			}
+		} else if (transfer.status === 'uploading') {
+			// R2 上行：按明文字节算比例（分母 file.size 也是明文）
+			const progress = transfer.originalSize ? (transfer.uploaded / transfer.originalSize) * 100 : 0;
+			if (progressContainer) {
+				progressContainer.style.display = 'block';
+				progressContainer.classList.remove('fade-out');
+			}
+			if (progressBar) progressBar.style.width = `${progress}%`;
+			if (statusText) statusText.textContent = `上传中 ${formatFileSize(transfer.uploaded || 0)} / ${formatFileSize(transfer.originalSize || 0)}`;
+			if (downloadBtn) {
+				downloadBtn.classList.remove('show', 'animate-in');
+				downloadBtn.style.display = 'none';
+			}
+		} else if (transfer.status === 'downloading') {
+			const progress = transfer.total ? (transfer.downloadedChunks / transfer.total) * 100 : 0;
+			if (progressContainer) {
+				progressContainer.style.display = 'block';
+				progressContainer.classList.remove('fade-out');
+			}
+			if (progressBar) progressBar.style.width = `${progress}%`;
+			if (statusText) statusText.textContent = `接收中 ${transfer.downloadedChunks || 0}/${transfer.total || 0}`;
+			if (downloadBtn) {
+				downloadBtn.classList.remove('show', 'animate-in');
+				downloadBtn.style.display = 'none';
+			}
+		} else if (transfer.status === 'ready') {
+			// 已就绪：接收方显示下载按钮，发送方什么都不显示
+			if (progressContainer) {
+				progressContainer.classList.add('fade-out');
+				setTimeout(() => { progressContainer.style.display = 'none'; }, 400);
+			}
+			if (downloadBtn) {
+				if (isSender) {
+					downloadBtn.classList.remove('show', 'animate-in');
+					downloadBtn.style.display = 'none';
+				} else {
+					downloadBtn.style.display = 'flex';
+					downloadBtn.classList.add('show');
+					downloadBtn.disabled = false;
+				}
+			}
+		} else if (transfer.status === 'failed') {
+			if (progressContainer) {
+				progressContainer.style.display = 'block';
+				progressContainer.classList.remove('fade-out');
+			}
+			if (progressBar) progressBar.style.width = '0%';
+			if (statusText) statusText.textContent = `失败：${transfer.error || '未知错误'}`;
 			if (downloadBtn) {
 				downloadBtn.classList.remove('show', 'animate-in');
 				downloadBtn.style.display = 'none';
@@ -619,12 +756,67 @@ export function handleFileMessage(message, isPrivate = false) {
 		case 'file_start':
 			handleFileStart(message, isPrivate);
 			break;
+		case 'file_offer':
+			handleFileOffer(message, isPrivate);
+			break;
 		case 'file_volume':
 			handleFileVolume(message);
 			break;
 		case 'file_complete':
 			handleFileComplete(message);
 			break;
+	}
+}
+
+/**
+ * 收到 R2 文件清单。
+ *
+ * 此刻密文已经在 R2 上了，所以状态直接是「可下载」——没有 needs-receiving 这一步。
+ * 真正下载由用户点下载按钮触发，避免一收到清单就替用户吃掉流量。
+ */
+function handleFileOffer(message, isPrivate) {
+	const { fileId, blobId, key, fileName, originalSize, total, chunkSize, mime, userName } = message;
+
+	if (!fileId || !blobId || !key) return;
+
+	const transfer = {
+		kind: 'r2',
+		isR2: true,
+		fileId,
+		blobId,
+		fileKey: key,
+		fileName,
+		originalSize,
+		total,
+		chunkSize,
+		mime,
+		status: 'ready',
+		downloadedChunks: 0,
+		userName
+	};
+
+	window.fileTransfers.set(fileId, transfer);
+
+	// 落地密钥材料，这样接收方刷新后仍能下载（否则密文还在 R2 上但没人解得开）
+	saveManifest({
+		fileId,
+		blobId,
+		key,
+		fileName,
+		mime,
+		size: originalSize,
+		total,
+		chunkSize
+	});
+
+	if (window.addOtherMsg) {
+		window.addOtherMsg(
+			{ type: 'file', fileId, fileName, originalSize, isR2: true, userName },
+			userName,
+			userName,
+			false,
+			isPrivate ? 'file_private' : 'file'
+		);
 	}
 }
 
@@ -713,9 +905,42 @@ function handleFileComplete(message) {
 // Download file from volumes
 // 从分卷下载文件
 export async function downloadFile(fileId) {
-	const transfer = window.fileTransfers.get(fileId);
-	if (!transfer || transfer.status !== 'completed') return;
-	
+	let transfer = window.fileTransfers.get(fileId);
+
+	// 刷新过页面：内存里的传输状态没了，但清单（含密钥）还在 IndexedDB 里。
+	// 密文本来就在 R2 上，所以完全可以接着下 —— 不查这一下的话文件就永远丢了。
+	if (!transfer) {
+		const manifest = await loadManifest(fileId);
+		if (manifest) {
+			transfer = {
+				kind: 'r2',
+				isR2: true,
+				fileId: manifest.fileId,
+				blobId: manifest.blobId,
+				fileKey: manifest.key,
+				fileName: manifest.fileName,
+				originalSize: manifest.size,
+				mime: manifest.mime,
+				total: manifest.total,
+				chunkSize: manifest.chunkSize,
+				status: 'ready',
+				downloadedChunks: 0,
+				isSender: false
+			};
+			window.fileTransfers.set(fileId, transfer);
+		}
+	}
+
+	if (!transfer) return;
+
+	// R2 路径：密文在 R2 上，下载 + 本地解密
+	if (transfer.isR2) {
+		await downloadR2File(fileId, transfer);
+		return;
+	}
+
+	if (transfer.status !== 'completed') return;
+
 	try {
 		if (transfer.isArchive) {
 			// Download archive as multiple files
@@ -729,6 +954,51 @@ export async function downloadFile(fileId) {
 	} catch (error) {
 		console.error('Download error:', error);
 		window.addSystemMsg(`Failed to download: ${error.message}`);
+	}
+}
+
+/**
+ * 从 R2 下载并解密，然后交给浏览器保存。
+ *
+ * 失败时状态退回 'ready' 而不是 'failed' —— 用户可以再点一次，且 IndexedDB 里
+ * 已完成的分块会复用，不用从头下。
+ */
+async function downloadR2File(fileId, transfer) {
+	if (transfer.status === 'downloading') return;
+
+	transfer.status = 'downloading';
+	transfer.downloadedChunks = 0;
+	updateFileProgress(fileId);
+
+	try {
+		const blob = await downloadFromR2({
+			blobId: transfer.blobId,
+			key: transfer.fileKey,
+			name: transfer.fileName,
+			mime: transfer.mime,
+			size: transfer.originalSize,
+			total: transfer.total,
+			chunkSize: transfer.chunkSize
+		}, {
+			onProgress: (p) => {
+				transfer.downloadedChunks = p.completed;
+				updateFileProgress(fileId);
+			}
+		});
+
+		saveBlob(blob, transfer.fileName);
+
+		transfer.status = 'completed';
+		updateFileProgress(fileId);
+
+	} catch (error) {
+		console.error('R2 download error:', error);
+		transfer.status = 'ready';
+		transfer.error = error.message;
+		updateFileProgress(fileId);
+		if (window.addSystemMsg) {
+			window.addSystemMsg(`下载失败：${transfer.fileName} — ${error.message}`);
+		}
 	}
 }
 

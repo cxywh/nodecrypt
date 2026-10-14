@@ -247,12 +247,15 @@ export function handleClientMessage(idx, msg) {
 	// Handle file messages
 	if (msgType.startsWith('file_')) {
 		// Part 1: Update message history and send notifications (for 'file_start' type)
-		if (msgType === 'file_start' || msgType === 'file_start_private') {
+		// file_offer 是 R2 大文件的清单，语义等价于 file_start（都是「来了一个文件」），
+		// 所以走同一套：进历史、发通知、在非当前房间加未读。
+		if (msgType === 'file_start' || msgType === 'file_start_private'
+			|| msgType === 'file_offer' || msgType === 'file_offer_private') {
 			let realUserName = msg.userName;
 			if (!realUserName && msg.clientId && newRd.userMap[msg.clientId]) {
 				realUserName = newRd.userMap[msg.clientId].userName || newRd.userMap[msg.clientId].username || newRd.userMap[msg.clientId].name;
 			}
-			const historyMsgType = msgType === 'file_start_private' ? 'file_private' : 'file';
+			const historyMsgType = (msgType === 'file_start_private' || msgType === 'file_offer_private') ? 'file_private' : 'file';
 			
 			const fileId = msg.data && msg.data.fileId;
 			if (fileId) { // Only proceed if we have a fileId
@@ -287,7 +290,8 @@ export function handleClientMessage(idx, msg) {
 			}
 		} else {
 			// If it's not the active room, only increment unread count for 'file_start' messages.
-			if (msgType === 'file_start' || msgType === 'file_start_private') {
+			if (msgType === 'file_start' || msgType === 'file_start_private'
+				|| msgType === 'file_offer' || msgType === 'file_offer_private') {
 				newRd.unreadCount = (newRd.unreadCount || 0) + 1;
 				renderRooms(activeRoomIndex);
 			}

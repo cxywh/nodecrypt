@@ -379,6 +379,22 @@ function renderFileMessage(fileData, isSender) {
 			progressWidth = `${progress}%`;
 			statusText = `Receiving ${transfer.receivedVolumes.size}/${transfer.totalVolumes}`;
 			showProgress = true;
+		} else if (transfer.status === 'uploading') {
+			const progress = transfer.originalSize ? (transfer.uploaded / transfer.originalSize) * 100 : 0;
+			progressWidth = `${progress}%`;
+			statusText = `上传中 ${formatFileSize(transfer.uploaded || 0)} / ${formatFileSize(transfer.originalSize || 0)}`;
+			showProgress = true;
+		} else if (transfer.status === 'downloading') {
+			const progress = transfer.total ? (transfer.downloadedChunks / transfer.total) * 100 : 0;
+			progressWidth = `${progress}%`;
+			statusText = `接收中 ${transfer.downloadedChunks || 0}/${transfer.total || 0}`;
+			showProgress = true;
+		} else if (transfer.status === 'ready') {
+			// 密文已在 R2 上，等用户点下载
+			downloadBtnStyle = isSender ? 'display: none;' : 'display: flex;';
+		} else if (transfer.status === 'failed') {
+			statusText = `失败：${transfer.error || '未知错误'}`;
+			showProgress = true;
 		} else if (transfer.status === 'completed') {
 			// 完成时不显示任何状态，只显示下载按钮
 			downloadBtnStyle = isSender ? 'display: none;' : 'display: flex;';

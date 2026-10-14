@@ -1,4 +1,5 @@
 import { generateClientId, encryptMessage, decryptMessage, logEvent, isString, isObject, getTime, deriveServerSessionKeyBytes, importAesKey, fromHex, toHex } from './utils.js';
+import { handleBlob } from './blob.js';
 
 // 协议版本。首帧必须带这个前缀，否则直接关连接（见 webSocketMessage）。
 const PROTOCOL_VERSION = 'NC2';
@@ -19,12 +20,23 @@ export default {
     //   · WebSocket 升级请求不跳（ws 客户端不跟随 301，会把握手直接打断）。
     //     页面被跳转到 https 之后，客户端自然改用 wss://。
     //   · 本地开发不跳（wrangler dev 在 http://127.0.0.1:8787 上跑）。
-    const isLocalHost = url.hostname === 'localhost'
-      || url.hostname === '127.0.0.1'
-      || url.hostname === '[::1]';
+    //
+    // ⚠️ 本地判据必须用 cf-connecting-ip，**不能用 hostname**：
+    //    因为 wrangler.toml 里有 [[routes]] custom_domain = "chat.cxywh.cn"，
+    //    wrangler dev 会把 request.url 的 host 和 Host 头**一起改写成 chat.cxywh.cn**。
+    //    实测：请求 http://127.0.0.1:8787/ 时，Worker 看到的是
+    //      url.hostname === 'chat.cxywh.cn'、host 头 === 'chat.cxywh.cn'
+    //    所以按域名判断「是不是本地」在 dev 下永远为 false —— 会导致本机所有
+    //    普通 HTTP 请求（含 /blob/ 上传下载）被 301 到线上，本地根本没法测。
+    //
+    //    request.cf / cf-colo 也不行：miniflare 会模拟（实测 colo='HKG'，
+    //    request.cf 存在），同样区分不出。
+    //    而 cf-connecting-ip 在生产恒为客户端公网 IP，dev 下是 127.0.0.1 —— 可用。
+    const clientIp = request.headers.get('cf-connecting-ip') || '';
+    const isLocalDev = clientIp === '127.0.0.1' || clientIp === '::1' || clientIp === '::ffff:127.0.0.1';
     const scheme = request.headers.get('X-Forwarded-Proto')
       || url.protocol.replace(':', '');
-    if (!isWebSocket && !isLocalHost && scheme === 'http') {
+    if (!isWebSocket && !isLocalDev && scheme === 'http') {
       url.protocol = 'https:';
       return Response.redirect(url.toString(), 301);
     }
@@ -35,6 +47,12 @@ export default {
       const stub = env.CHAT_ROOM.get(id);
       return stub.fetch(request);
     }
+
+    // 文件密文端点（R2）。只在路径匹配 /blob/... 时接管，其余交回下面的路由。
+    // 放在这里而不是 DO 里：文件密文不该经过 Durable Object —— 那会把时长计费
+    // 和单对象吞吐都拖进大文件传输路径。
+    const blobResponse = await handleBlob(request, env, url);
+    if (blobResponse) return blobResponse;
 
     // 处理API请求
     if (url.pathname.startsWith('/api/')) {

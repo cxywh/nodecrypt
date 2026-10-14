@@ -19,6 +19,19 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["ChatRoom"]
 
+# 文件密文存储
+#
+# R2 里只放**密文**：客户端本地分块 AES-GCM 加密后上传，密钥从不经过服务端。
+# 对象名只含随机 blobId + 块号，不含文件名、不含任何用户信息 —— 服务端无法把
+# 对象关联到人，也解不开。
+#
+# ⚠️ 需要在 Cloudflare 控制台先开通 R2（R2 免费额度要绑定支付方式）：
+#    控制台 → R2 → Enable R2，然后 npx wrangler r2 bucket create nodecrypt-files
+#    wrangler dev 自带本地 R2 模拟器，所以本机开发调试不依赖这一步。
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "nodecrypt-files"
+
 # 自定义域：把 chat.cxywh.cn 绑到这个 Worker
 #
 # 用 Workers 的 Custom Domain 机制（custom_domain = true），
