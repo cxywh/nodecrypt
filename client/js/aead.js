@@ -71,13 +71,15 @@ export function toHex(input) {
 }
 
 export function fromHex(value) {
-	const hex = String(value);
-	if (hex.length % 2 !== 0 && /[^0-9a-fA-F]/.test(hex)) {
-		throw new Error('invalid hex');
+	if (typeof value !== 'string') {
+		throw new TypeError(`fromHex 需要字符串，收到 ${value === null ? 'null' : typeof value}`);
 	}
-	const bytes = new Uint8Array(hex.length >> 1);
+	if (value.length % 2 !== 0 || /[^0-9a-fA-F]/.test(value)) {
+		throw new Error(`fromHex: 非法十六进制字符串（长度 ${value.length}）`);
+	}
+	const bytes = new Uint8Array(value.length >> 1);
 	for (let i = 0; i < bytes.length; i++) {
-		bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+		bytes[i] = parseInt(value.substr(i * 2, 2), 16);
 	}
 	return bytes;
 }

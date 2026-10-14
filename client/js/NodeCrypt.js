@@ -115,7 +115,23 @@ class NodeCrypt {
 		try {
 			this.connection = new WebSocket(this.config.wsAddress);
 			this.connection.onopen = this.onOpen;
-			this.connection.onmessage = this.onMessage;
+			// 串行化 onMessage —— 这是必须的，不是优化。
+			//
+			// a:'c' 帧承载两种含义：对端公钥(hex) 和 业务密文(base64)，
+			// 而代码靠 channel[id].shared 这个可变标志来区分。
+			// onMessage 是 async，而 onmessage 不会被 await，所以多个消息会并发执行。
+			// 并发窗口里后启动的 handler 看到 shared 仍是 null，就会把密文当公钥
+			// 送进 deriveEcdhSecret -> fromHex 抛错；错误又被 catch 吞进日志，
+			// 对外表现是「两个人几乎同时进房，互相看不见」，且界面毫无提示。
+			//
+			// 帧本身按 WebSocket 顺序到达，串行处理即可保证
+			// 「某个对端的第一条 a:'c' 必定携带它的公钥」这个不变式成立。
+			this._msgQueue = Promise.resolve();
+			this.connection.onmessage = (event) => {
+				this._msgQueue = this._msgQueue
+					.then(() => this.onMessage(event))
+					.catch(() => {})
+			};
 			this.connection.onerror = this.onError;
 			this.connection.onclose = this.onClose
 		} catch (error) {

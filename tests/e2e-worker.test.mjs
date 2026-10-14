@@ -42,8 +42,14 @@ class TestClient {
 
 	async connect() {
 		this.ws = new WebSocket(WS_URL);
+		// 串行化消息处理：a:'c' 帧既可能是对端公钥、也可能是业务密文，
+		// 代码靠 peer.shared 区分。并发处理会让后启动的 handler 看到 shared
+		// 仍是 null，于是把密文当公钥 -> fromHex 抛错。帧本身按序到达，串行即可。
+		this._queue = Promise.resolve();
 		this.ws.addEventListener('message', (ev) => {
-			this._onMessage(ev.data).catch(e => this.errors.push(String(e && e.message ? e.message : e)));
+			this._queue = this._queue
+				.then(() => this._onMessage(ev.data))
+				.catch((e) => this.errors.push(String(e && e.message ? e.message : e)));
 		});
 		this.ws.addEventListener('error', () => this.errors.push('ws error'));
 		await new Promise((res, rej) => {
@@ -163,11 +169,15 @@ const bob = new TestClient('Bob');
 try {
 	await alice.connect();
 	await bob.connect();
-	await sleep(400);
 
 	console.log('[1] 服务端握手');
-	check('Alice 完成握手并拿到会话密钥', !!alice.serverShared);
-	check('Bob 完成握手并拿到会话密钥', !!bob.serverShared);
+	// 这里以前是 sleep(400) 后直接断言，跨洋链路（经代理打 SJC 节点）下必然假失败：
+	// 握手要走 WS 连接 -> 服务端发公钥 -> 客户端发公钥 -> 服务端 P-384 ECDH + RSA 签名
+	// -> 客户端 RSA 验签 + PBKDF2 60 万次，往返远不止 400ms。改成等待条件成立。
+	const hsA = await alice.waitFor(() => alice.serverShared || null, 20000);
+	const hsB = await bob.waitFor(() => bob.serverShared || null, 20000);
+	check('Alice 完成握手并拿到会话密钥', !!hsA);
+	check('Bob 完成握手并拿到会话密钥', !!hsB);
 	check('拿到服务端公钥指纹', /^([0-9A-F]{4} ){15}[0-9A-F]{4}$/.test(alice.fingerprint || ''),
 		alice.fingerprint);
 
