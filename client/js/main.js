@@ -116,6 +116,64 @@ window.downloadFile = downloadFile;
 
 // 当 DOM 内容加载完成后执行初始化逻辑
 // Run initialization logic when the DOM content is fully loaded
+// 加密能力预检。
+// crypto.subtle 只在安全上下文（HTTPS 或 localhost）中存在；部分内嵌浏览器
+// （QQ、微信等 WebView）虽然提供该对象，却缺少 HKDF 等派生算法。任一前提不满足时，
+// 密钥协商会失败，而失败发生在异步链路中不会冒泡到界面，用户只会看到“连接超时”。
+// 因此进入房间之前逐项探测本项目实际使用的原语，缺失时给出可操作的提示。
+// 探测项集中声明，新增一项只增加一个数组元素。
+const CRYPTO_PROBES = [
+	['sha-256', (subtle, bytes) => subtle.digest('SHA-256', bytes(1))],
+	['hkdf', async (subtle, bytes) => {
+		const key = await subtle.importKey('raw', bytes(16), 'HKDF', false, ['deriveBits']);
+		await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: bytes(16), info: bytes(1) }, key, 128);
+	}],
+	['pbkdf2', async (subtle, bytes) => {
+		const key = await subtle.importKey('raw', bytes(16), 'PBKDF2', false, ['deriveBits']);
+		await subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: bytes(16), iterations: 1000 }, key, 128);
+	}],
+	['ecdh-p256', async (subtle, bytes) => {
+		const pair = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+		await subtle.deriveBits({ name: 'ECDH', public: pair.publicKey }, pair.privateKey, 256);
+	}],
+	['aes-256-gcm', async (subtle, bytes) => {
+		const key = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+		const iv = bytes(12);
+		const ciphertext = await subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes(1));
+		await subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+	}]
+];
+
+async function checkCryptoCapabilities() {
+	const missing = [];
+	if (!window.isSecureContext) missing.push('secure-context');
+	const subtle = window.crypto && window.crypto.subtle;
+	if (!subtle) {
+		missing.push('webcrypto');
+		return missing;
+	}
+	const bytes = (length) => new Uint8Array(length);
+	for (const [name, probe] of CRYPTO_PROBES) {
+		try {
+			await probe(subtle, bytes);
+		} catch (err) {
+			missing.push(name);
+		}
+	}
+	return missing;
+}
+
+// 把登录卡内容替换为原因提示。技术明细只写进控制台，便于排查，不展示给用户。
+function showCryptoUnsupported(missing, form) {
+	console.warn('[NodeCrypt] crypto capability check failed:', missing.join(', '));
+	if (!form) return;
+	const notice = document.createElement('div');
+	notice.className = 'capability-notice';
+	notice.textContent = t('ui.crypto_unsupported', '\u5f53\u524d\u6d4f\u89c8\u5668\u7f3a\u5c11\u5efa\u7acb\u8fde\u63a5\u6240\u9700\u7684\u52a0\u5bc6\u80fd\u529b\u3002\u8bf7\u6539\u7528\u7cfb\u7edf\u81ea\u5e26\u6d4f\u89c8\u5668\u6253\u5f00\u672c\u9875\u9762\u3002');
+	form.textContent = '';
+	form.appendChild(notice);
+}
+
 window.addEventListener('DOMContentLoaded', () => {
 	// 移除预加载样式类，允许过渡效果
 	// Remove preload class to allow transitions
@@ -128,10 +186,19 @@ window.addEventListener('DOMContentLoaded', () => {
 
 	const loginForm = $id('login-form');               // 登录表单 / Login form
 
-	if (loginForm) {
-		// 监听登录表单提交事件 / Listen to login form submission
-		loginForm.addEventListener('submit', loginFormHandler(null))
-	}
+	// 加密能力预检不通过时不再挂载提交处理，直接把登录卡换成原因提示。
+	// 若照常挂载，用户在缺少加密能力的浏览器里提交后只会看到“连接超时”，
+	// 无法判断是浏览器的问题，会反复重试。
+	checkCryptoCapabilities().then((missing) => {
+		if (missing.length) {
+			showCryptoUnsupported(missing, loginForm);
+			return;
+		}
+		if (loginForm) {
+			// 监听登录表单提交事件 / Listen to login form submission
+			loginForm.addEventListener('submit', loginFormHandler(null))
+		}
+	});
 
 	const joinBtn = $('.join-room'); // 加入房间按钮 / Join room button
 	if (joinBtn) {

@@ -1889,3 +1889,13 @@ flex-direction: column;
 h2{
 	margin: 0%;
 }
+
+/* 加密能力预检未通过时的提示。此时登录卡内不再有输入项，只有这段说明。 */
+.capability-notice {
+	padding: 12px 14px;
+	border: 1px solid var(--border-color, #d0d7de);
+	border-radius: 8px;
+	line-height: 1.6;
+	color: var(--text-color, #24292f);
+	word-break: break-word;
+}
