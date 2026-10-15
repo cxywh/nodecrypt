@@ -32,3 +32,10 @@ export function textToHTML(text) {
 		ALLOWED_ATTR: [],     // 不允许任何属性
 	});
 }
+
+// 校验 fileId 是否符合生成器产出的字符集。
+// fileId 来自对端消息，会进入 HTML 属性与 CSS 选择器；只接受 [A-Za-z0-9_-]，
+// 其余一律判为异常客户端发来的消息，在接收侧丢弃。
+export function isSafeFileId(id) {
+	return typeof id === 'string' && id.length > 0 && id.length <= 80 && /^[A-Za-z0-9_-]+$/.test(id);
+}

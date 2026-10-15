@@ -2,6 +2,7 @@
 // 导入必要的模块
 import { deflate, inflate } from 'fflate';
 import { packVolumeRecord } from './aead.js';
+import { isSafeFileId } from './util.string.js';
 import { showFileUploadModal } from './util.fileUpload.js';
 import { uploadToR2, downloadFromR2, saveBlob, saveManifest, loadManifest, isR2Available, R2_THRESHOLD } from './util.blob.js';
 
@@ -795,6 +796,7 @@ function handleFileOffer(message, isPrivate) {
 	const { fileId, blobId, key, fileName, originalSize, total, chunkSize, mime, userName } = message;
 
 	if (!fileId || !blobId || !key) return;
+	if (!isSafeFileId(fileId)) return;
 
 	const transfer = {
 		kind: 'r2',
@@ -841,6 +843,9 @@ function handleFileOffer(message, isPrivate) {
 // 处理文件开始消息
 function handleFileStart(message, isPrivate) {
 	const { fileId, fileName, originalSize, compressedSize, totalVolumes, originalHash, archiveHash, fileCount, fileManifest, isArchive, userName } = message;
+	// fileId 由对端提供，会进入 DOM 属性与 CSS 选择器。不符合生成器字符集的一律丢弃，
+	// 避免畸形标识在渲染阶段被当作标记解析。
+	if (!isSafeFileId(fileId)) return;
 	
 	const fileTransfer = {
 		fileId,
