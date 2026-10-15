@@ -4,6 +4,276 @@ import { handleBlob } from './blob.js';
 // 协议版本。首帧必须带这个前缀，否则直接关连接（见 webSocketMessage）。
 const PROTOCOL_VERSION = 'NC2';
 
+// Turnstile 服务端校验端点。
+const TURNSTILE_VERIFY_URL = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+
+/**
+ * 校验一枚 Turnstile token。
+ *
+ * 几个刻意的设计：
+ *
+ *  · **TURNSTILE_BYPASS 是给自动化脚本用的服务口令，不是 Turnstile token**。
+ *    本项目所有测试（e2e-worker / send-file-to-peer / 房间规模压测）都直连线上，
+ *    没有浏览器可以解 Turnstile。用一条独立的长随机串放行它们，它存在 Worker
+ *    secret 里、不进仓库；泄露了随时换一个即可。**这是刻意留的口子，不是疏漏。**
+ *
+ *  · **fail-closed**：siteverify 网络失败 / 返回非 2xx / JSON 解析失败，一律拒绝。
+ *    宁可挡掉一次正常连接（用户刷新即可），也不能让验证形同虚设。
+ *
+ *  · **token 由 Cloudflare 保证一次性**，所以这里不需要自己去重。
+ */
+async function verifyTurnstile(token, env, ip) {
+  if (!isString(token) || token === '') {
+    return false;
+  }
+  // 测试通道（见上方说明）
+  if (env.TURNSTILE_BYPASS && safeEqual(token, env.TURNSTILE_BYPASS)) {
+    return true;
+  }
+  const form = new FormData();
+  form.append('secret', env.TURNSTILE_SECRET);
+  form.append('response', token);
+  if (ip) form.append('remoteip', ip);
+  let res;
+  try {
+    res = await fetch(TURNSTILE_VERIFY_URL, { method: 'POST', body: form });
+  } catch (error) {
+    logEvent('turnstile-fetch', error, 'error');
+    return false;
+  }
+  if (!res.ok) {
+    logEvent('turnstile-http', res.status, 'error');
+    return false;
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (error) {
+    logEvent('turnstile-json', error, 'error');
+    return false;
+  }
+  if (data.success !== true) {
+    // error-codes 例如 invalid-input-response（token 重复用/过期）、
+    // timeout-or-duplicate。记下来，不然线上被拒时无从查起。
+    logEvent('turnstile-reject', data['error-codes']);
+    return false;
+  }
+  return true;
+}
+
+// =============================================================================
+// 来源（Origin）白名单
+//
+// **开源后保护自己实例的第一道闸。**
+//
+// 为什么必须有：客户端源码一旦公开，任何人都能拿它 fork 一版、把连接地址改指到
+// 你这台服务器 —— 你的免费额度替他扛。浏览器**无法伪造** Origin 头，所以这一层
+// 能干净地挡掉「网页壳一改就直连我」这条路径。
+//
+// 它不是万能墙：非浏览器客户端（curl / Node / 脚本）可以随手写一个 Origin 头。
+// 所以它必须和 Turnstile **叠着用**，两者互补：
+//   · Origin 白名单  -> 挡「网页 fork 一版指向我」
+//   · Turnstile      -> 挡「脚本批量连」（要求真实浏览器、在我域名上解出挑战）
+// 单用任何一个都有明显缺口，合起来才能把成本抬到「不值得」。
+//
+// 配置：wrangler.toml 的 [vars] ALLOWED_ORIGINS（逗号分隔多个）。
+//   · **留空 = 完全不校验**。这样自建者 clone 下来开箱可用，也保住本地开发。
+//   · 生产务必配上，否则该限制等于没有。
+// =============================================================================
+
+function allowedOriginList(env) {
+  return String(env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * 这个请求的来源是否在白名单里。
+ *
+ * 注意「没带 Origin」的处理：浏览器发 WebSocket 时**一定**会带 Origin，
+ * 所以缺这个头基本等于「不是网页客户端」。但为了不让自建者莫名其妙连不上，
+ * 缺头时**不直接判死** —— 交给 Turnstile 去挡（那才是真正难伪造的一层）。
+ * 只做「带了但不认识」的拒绝，误伤面最小。
+ */
+function originAllowed(request, env) {
+  const allowed = allowedOriginList(env);
+  if (allowed.length === 0) return true;        // 没配 = 不校验
+
+  const origin = request.headers.get('Origin');
+  if (!origin) return true;                     // 没带 -> 交给 Turnstile
+  return allowed.includes(origin);
+}
+
+// =============================================================================
+// 举报收件箱
+//
+// 为什么自建而不是在页面上留个邮箱：
+//   · `cxywh.cn` **没有 MX 记录**（实测），`@cxywh.cn` 的信收不到；
+//   · 把站长的私人邮箱印在公开页面上也不合适。
+// 所以举报走 Worker -> DO storage：零成本、不依赖任何外部服务、不暴露邮箱、
+// 不用额外申请任何东西。
+//
+// 必须说清的局限：**E2EE 意味着服务端读不到聊天内容**（这正是这应用存在的理由）。
+// 所以举报人要自己提供证据（房间名/对方昵称/时间/截图）；没有证据时，
+// 运营方能做的只有封出口 IP、封房间号。
+//
+// 存储放在既有的 ChatRoom DO 里（它已经是全局单实例），不新开 DO 类 ——
+// 新开类要加 migration，为几张举报记录不值得动部署配置。
+// =============================================================================
+
+const REPORT_KEEP = 500;          // 最多保留多少条，超出丢最旧的
+const REPORT_SHORT_MAX = 200;     // 房间名 / 昵称 / 时间 / 联系方式 的上限
+const REPORT_DETAIL_MAX = 2000;   // 描述上限
+const REPORT_PER_HOUR = 10;       // 同一 IP 每小时最多提交多少条
+const REPORT_WINDOW_MS = 3600000;
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+/**
+ * 定长比较。用 `!==` 比密钥会在第一个不同的字符处短路，比较耗时随匹配前缀变化，
+ * 理论上能被逐字节猜出来。这里永远走满整串。
+ */
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** 取字符串字段并夹住长度。非字符串一律当空串。 */
+function field(value, max) {
+  return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+
+/** UTC 日界，形如 `2026-10-15`。用 UTC 而不是本地时区，免得跟着时区漂。 */
+function dayKey(ts) {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+function reportStub(env) {
+  return env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName('chat-room'));
+}
+
+/** 举报页的 HTML 转义。举报内容是对端可控的文本，直接拼进页面就是 XSS。 */
+function esc(text) {
+  return String(text == null ? '' : text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function handleReportPost(request, env, clientIp) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: 'bad_json' }, 400);
+  }
+
+  const record = {
+    ts: Date.now(),
+    ip: clientIp,
+    room: field(body.room, REPORT_SHORT_MAX),
+    peer: field(body.peer, REPORT_SHORT_MAX),
+    when: field(body.when, REPORT_SHORT_MAX),
+    contact: field(body.contact, REPORT_SHORT_MAX),
+    detail: field(body.detail, REPORT_DETAIL_MAX),
+  };
+
+  // 只有描述是必填 —— 房间名可能没记、昵称可能没看清，
+  // 但这些都没记住不等于没被骚扰。描述是唯一无法替代的信息。
+  if (record.detail.length < 10) {
+    return json({ ok: false, error: 'detail_too_short' }, 400);
+  }
+
+  const res = await reportStub(env).fetch('https://chat-room.internal/internal/report', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(record),
+  });
+  const data = await res.json();
+  return json(data, res.status);
+}
+
+/**
+ * 清空收件箱。用 **POST** 而不是带副作用的 GET —— GET 有可能被浏览器预取、
+ * 被爬虫抓、被放进历史记录里重放；带副作用的操作必须是显式的 POST。
+ */
+async function handleAdminClear(env, url) {
+  if (!env.ADMIN_KEY) return new Response('Not Found', { status: 404 });
+  if (!safeEqual(url.searchParams.get('key') || '', env.ADMIN_KEY)) {
+    return new Response('Not Found', { status: 404 });
+  }
+  await reportStub(env).fetch('https://chat-room.internal/internal/reports', { method: 'DELETE' });
+  return Response.redirect(url.origin + url.pathname + '?key=' + encodeURIComponent(env.ADMIN_KEY), 303);
+}
+
+async function handleAdminReports(env, url) {
+  // 没配 ADMIN_KEY 就当作这个端点不存在 —— 别泄露「有这么个后台」。
+  if (!env.ADMIN_KEY) return new Response('Not Found', { status: 404 });
+  if (!safeEqual(url.searchParams.get('key') || '', env.ADMIN_KEY)) {
+    return new Response('Not Found', { status: 404 });
+  }
+
+  const res = await reportStub(env).fetch('https://chat-room.internal/internal/reports');
+  const data = await res.json();
+  const reports = data.reports || [];
+
+  const rows = reports.map((r) => `<tr>
+    <td>${esc(new Date(r.ts).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }))}</td>
+    <td>${esc(r.ip)}</td>
+    <td>${esc(r.room)}</td>
+    <td>${esc(r.peer)}</td>
+    <td>${esc(r.when)}</td>
+    <td>${esc(r.contact)}</td>
+    <td class="d">${esc(r.detail)}</td>
+  </tr>`).join('');
+
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>举报收件箱</title><style>
+body{margin:0;padding:20px;background:#fff;color:#333;
+  font-family:'Roboto',Arial,'Microsoft YaHei',sans-serif;font-size:14px}
+h1{font-size:18px;margin:0 0 4px}
+p.n{color:#888;margin:0 0 16px}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #e3e6ea;padding:7px 9px;text-align:left;vertical-align:top}
+th{background:#fafbfc;font-weight:600;white-space:nowrap}
+td.d{white-space:pre-wrap;max-width:460px}
+tr:nth-child(even) td{background:#fcfdfe}
+form{margin:0 0 14px}
+button{padding:7px 16px;border:1px solid #d64545;background:#fff;color:#d64545;
+  border-radius:4px;font-size:13px;font-family:inherit;cursor:pointer}
+button:hover{background:#d64545;color:#fff}
+</style></head><body>
+<h1>举报收件箱</h1>
+<p class="n">共 ${reports.length} 条（最多保留 ${REPORT_KEEP} 条，新的在前）</p>
+<form method="post" onsubmit="return confirm('确定清空全部举报记录？此操作不可撤销。')">
+  <button type="submit">清空全部</button>
+</form>
+<table><thead><tr><th>收到时间</th><th>来源 IP</th><th>房间</th><th>对方昵称</th>
+<th>事发时间</th><th>联系方式</th><th>描述</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="7">暂无举报</td></tr>'}</tbody></table>
+</body></html>`;
+
+  // 后台密钥以查询串形式出现在 URL 中，因此该页面必须禁止缓存并禁止外发 Referer ——
+  // 否则密钥会随页面进入浏览器磁盘缓存，或在页面内任何外链跳转时进入 Referer 头。
+  return new Response(html, {
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+    },
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -21,7 +291,7 @@ export default {
     //     页面被跳转到 https 之后，客户端自然改用 wss://。
     //   · 本地开发不跳（wrangler dev 在 http://127.0.0.1:8787 上跑）。
     //
-    // ⚠️ 本地判据必须用 cf-connecting-ip，**不能用 hostname**：
+    // 注意：本地判据必须用 cf-connecting-ip，**不能用 hostname**：
     //    因为 wrangler.toml 里有 [[routes]] custom_domain = "chat.cxywh.cn"，
     //    wrangler dev 会把 request.url 的 host 和 Host 头**一起改写成 chat.cxywh.cn**。
     //    实测：请求 http://127.0.0.1:8787/ 时，Worker 看到的是
@@ -43,9 +313,58 @@ export default {
 
     // 处理WebSocket请求
     if (isWebSocket) {
+      // 人机验证。门槛只放在**建连**这一步，消息路径完全不动。
+      //
+      // 为什么必须挡在这里：免费版额度一旦超了是直接拒绝服务（不是降速），
+      // 所以被机器人/机会性滥用者都代价是「所有正常用户一起用不了」。
+      // 而建连是唯一一次性的、便宜的校验点 —— 每条消息都验的话，
+      // siteverify 的往返会把聊天延迟拖垮。
+      //
+      // 两种不校验的情况：
+      //   · 本地开发（wrangler dev，cf-connecting-ip 是回环）—— 没有真实 Turnstile 可解
+      //   · 没配 TURNSTILE_SECRET —— 行为与接入前完全一致，方便灰度
+      const rawToken = url.searchParams.get('t') || '';
+      // 测试通道：token 命中 TURNSTILE_BYPASS。这个值只有我们自己知道，
+      // 它决定 DO 侧的 IP 限流是否豁免（拿给自动化脚本用）。
+      const isTestChannel = !!(env.TURNSTILE_BYPASS && safeEqual(rawToken, env.TURNSTILE_BYPASS));
+      // 本地开发也当测试通道 —— cf-connecting-ip 是回环，所有本地测试共用一个 key。
+      const testChannel = isTestChannel || isLocalDev;
+
+      // 来源白名单。排在 Turnstile **之前** —— 它是本地的字符串比对，成本几乎为零，
+      // 让明显不该来的请求连 siteverify 的往返都不用付。
+      //
+      // **必须排在 `isTestChannel` 声明之后**。它要用到这个 const，放前面会踩暂时性
+      // 死区（TDZ），整个 WS 分支报 `Cannot access 'isTestChannel' before initialization`
+      // —— 线上表现是**所有建连 500**，而不是 403，容易误判为"部署故障"。（已实测复现）
+      //
+      // 测试通道与本地开发跳过 —— 自动化脚本从命令行发起，不带 Origin。
+      if (!isLocalDev && !isTestChannel && !originAllowed(request, env)) {
+        logEvent('origin-rejected', request.headers.get('Origin') || '(none)', 'error');
+        return new Response('本站只服务于自己的前端页面。若你在使用第三方客户端，请改连你自己的服务器。', {
+          status: 403,
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        });
+      }
+      if (!isLocalDev && env.TURNSTILE_SECRET) {
+        if (!await verifyTurnstile(rawToken, env, clientIp)) {
+          return new Response('人机验证未通过，请刷新页面重试。', {
+            status: 403,
+            headers: { 'content-type': 'text/plain; charset=utf-8' },
+          });
+        }
+      }
+      // 把「这是测试通道吗」告诉 DO：DO 里要据此豁免 IP 限流（自动化脚本会从同一个
+      // 出口 IP 开上百条连接）。
+      //
+      // **必须先 delete 再 set**：入站请求可能自带一个伪造的 x-nc-test-channel，
+      // 如果不删就直接 set，客户端只要手写这个头就能直接取得豁免。
+      // 这里先无条件删掉，再根据**我们自己的** Turnstile 校验结果决定是否设置。
       const id = env.CHAT_ROOM.idFromName('chat-room');
       const stub = env.CHAT_ROOM.get(id);
-      return stub.fetch(request);
+      const fwdHeaders = new Headers(request.headers);
+      fwdHeaders.delete('x-nc-test-channel');
+      if (testChannel) fwdHeaders.set('x-nc-test-channel', '1');
+      return stub.fetch(new Request(request, { headers: fwdHeaders }));
     }
 
     // 文件密文端点（R2）。只在路径匹配 /blob/... 时接管，其余交回下面的路由。
@@ -53,6 +372,16 @@ export default {
     // 和单对象吞吐都拖进大文件传输路径。
     const blobResponse = await handleBlob(request, env, url);
     if (blobResponse) return blobResponse;
+
+    // 举报入口的后端。**必须放在下面 /api/ 回退之前** —— 那个回退只返回 {ok:true}，
+    // 写在它后面会被吃掉，表现为「提交成功但什么都没存」。
+    if (url.pathname === '/api/report') {
+      return handleReportPost(request, env, clientIp);
+    }
+    if (url.pathname === '/admin/reports') {
+      if (request.method === 'POST') return handleAdminClear(env, url);
+      return handleAdminReports(env, url);
+    }
 
     // 处理API请求
     if (url.pathname.startsWith('/api/')) {
@@ -99,9 +428,63 @@ export class ChatRoom {
     this.keyCache = {};
 
     this.config = {
-      seenTimeout: 60000,
-      debug: false
+      // 连接活跃超时：超过该时长未收到任何消息的连接，由 cleanupOldConnections()
+      // 关闭并回收。服务端在收到任何消息时刷新该连接的时间戳，客户端以 pingInterval
+      // 周期发送 'ping' 维持活跃。取 180 秒是为了容忍移动端页面进入后台后定时器被
+      // 系统节流的情况。该值同时决定异常断线（未收到 close 帧）的最长滞留时间，
+      // 因此不宜过大。
+      seenTimeout: 180000,
+      debug: false,
+
+      // IP 级建连频率限制（精确计数，见 allowConnection 的说明）
+      connWindowMs: 60000,      // 滑动窗口长度
+      maxConnPerMinute: 60,     // 窗口内单个 IP 允许的建连次数
+      maxTrackedIps: 5000,      // ipHits 的规模上限，防止无界增长
+
+      // 每 IP 每日建连上限。**这条和上面那个 60/分钟是两种不同的保护**，都要有：
+      //   · 60/分钟  -> 挡「瞬时洪水」，防的是把 DO 打爆
+      //   · 每日上限 -> 挡「细水长流」，防的是单个 IP 把一整天的免费额度耗光
+      // 只靠分钟限制的话：60 × 60 × 24 = 86,400 次/天，一个 IP 就能吃掉全天额度。
+      // 3000 的取值理由：校园/机房 NAT 后面几十人共用出口 IP，每人每天重连十几次
+      // 大约几百次，3000 有十倍余量；而一个滥用的 IP 被压到全天额度的 3% 上下。
+      // 有真实用户被误伤就调大它 —— 这个数字是运营参数，不是安全边界。
+      maxConnPerIpPerDay: 3000,
+
+      // ── 房间人数封顶 ────────────────────────────────────────────────────
+      // 实测依据（N 个客户端**同时**进房 = 最坏情况；本机 i7 桌面、Node）：
+      //     N= 50 -> 全体握手  6.8s   ✓
+      //     N= 80 -> 全体握手 12.7s   ✓
+      //     N= 90 -> 全体握手 15.2s   ✓
+      //     N= 95 -> 握手超时未完成   ✗   ← 不稳定区从这里开始
+      //    N=100 -> 一次 19.1s 成功、一次超时   ← 同一参数掷硬币
+      //    N=150 -> 连接本身就 48.7s，握手从未完成
+      //
+      // 关键：90 以上**不是稳定地崩，是偶发失败**。这比稳定崩更糟 —— 用户进了
+      // 个坏房间却看不出原因（每个客户端只握到 0~94 个对端，密钥倒是握了 122 套），
+      // 只会觉得「这软件时好时坏」。封顶因此必须落在**稳定区**内。
+      //
+      // 取 50 而不是 80/90：上面那组数跑在桌面 CPU 上、且 N 个客户端挤在一个
+      // Node 进程里；真实用户是手机，ARM 上的 WebCrypto 明显更慢，而**手机上的
+      // 断点没有实测过**。50 相对不稳定区（95+）留了近一倍余量，足以吸收客户端
+      // 变慢而不必改这个数。要放开就改这一个值 —— 改完请重跑容量测试。
+      //
+      // 为什么这拦得住：判定只读 state.getWebSockets() 上活 socket 的 attachment
+      // （syncClients 重建出的 channels），客户端改源码也伪造不了。
+      maxRoomMembers: 50,
+
+      // 全站并发保险丝。所有房间共用**同一个 DO 实例**（idFromName('chat-room')），
+      // 单点风险就落在它身上：硬上限 32,768 个 socket、软上限约 1,000 req/s。
+      // 500 是**策略值不是容量值** —— 远低于硬上限，同时让转发负载可控。
+      // 有真实用量后再回头调。
+      maxTotalMembers: 500,
     };
+
+    // ip -> 窗口内的建连时间戳数组。由 storage 支撑（Hibernation 会驱逐内存，
+    // 见 loadIpHits 的说明），`ipHitsLoaded` 保证每个实例只读一次 storage。
+    this.ipHits = new Map();
+    // ip -> { d: 'YYYY-MM-DD'(UTC), n: 当日计数 }。同样由 storage 支撑。
+    this.ipDaily = new Map();
+    this.ipHitsLoaded = false;
 
     // 初始化 RSA 密钥对（存在 storage 里，驱逐后能自愈）
     this.initRSAKeyPair();
@@ -197,11 +580,197 @@ export class ChatRoom {
     }
   }
 
+  /**
+   * 收一条举报。
+   *
+   * 两个上限都是为了防止「举报接口自己被拿来刷」：
+   *   · 同一 IP 每小时 REPORT_PER_HOUR 条 —— 靠**扫描已存记录**算出来，不额外存计数器：
+   *     数组最多 REPORT_KEEP 条，扫一遍很便宜，少一份要维护的状态。
+   *   · 总量封顶 REPORT_KEEP 条，超出丢最旧的。举报是**给人看的**，不是审计日志，
+   *     没有无限留存的必要；留 500 条足够，也免得存储无限长大。
+   */
+  async handleReportSubmit(request) {
+    let record;
+    try {
+      record = await request.json();
+    } catch {
+      return Response.json({ ok: false, error: 'bad_json' }, { status: 400 });
+    }
+
+    const now = Date.now();
+    const stored = (await this.state.storage.get('reports')) || [];
+
+    const recent = stored.filter((r) => r.ip === record.ip && now - r.ts < REPORT_WINDOW_MS);
+    if (recent.length >= REPORT_PER_HOUR) {
+      return Response.json({ ok: false, error: 'too_many' }, { status: 429 });
+    }
+
+    const next = [record, ...stored].slice(0, REPORT_KEEP);
+    await this.state.storage.put('reports', next);
+    return Response.json({ ok: true, total: next.length });
+  }
+
+  /**
+   * IP 级建连频率限制 —— **精确计数**，滑动窗口。
+   *
+   * 为什么不用 Workers 的 `[[ratelimits]]` binding：本机线上实测，它在可用的阈值
+   * 区间里根本不执法（limit=30 和 60 时，同一 IP 连打 200 次全部放行；只有压到
+   * limit=1 才拦得住）。详见 wrangler.toml 顶部那张实测表。
+   *
+   * 为什么放 DO 里：连接本来就要进这个 DO，**不增加额外往返**；计数确定性，
+   * 不受「机房本地缓存 + 异步同步」的滞后影响。
+   *
+   * **必须落 storage，只靠内存不行**（实测打回）：Hibernation 下 DO 在没有活
+   * socket 时会被驱逐，内存里的 Map 直接没了。实测表现是「同一 IP 连打 90 次全部
+   * 放行」—— 因为每次 curl 建完就连断，DO 每次都当新实例启动，计数永远累不起来。
+   *
+   * 所以：**load 一次到内存 -> 同步判定/累加 -> 落盘**。判定在内存里同步做，
+   * 避免多个 fetch 交错 await 时读到同一份旧值（那正是洪水场景）。
+   *
+   * 代价是每次建连 1 读 + 1 写 storage。建连是低频事件（不是每条消息），
+   * 这个量级可以接受。
+   *
+   * 判据是**建连次数**，不是并发数 —— 并发封顶是另一件事。
+   */
+  async loadIpHits() {
+    if (this.ipHitsLoaded) return;
+    try {
+      const [stored, daily] = await Promise.all([
+        this.state.storage.get('ipRate'),
+        this.state.storage.get('ipDaily'),
+      ]);
+      this.ipHits = new Map(Object.entries(stored || {}));
+      this.ipDaily = new Map(Object.entries(daily || {}));
+    } catch (error) {
+      logEvent('ratelimit-load', error, 'error');
+      // 读失败当空表：宁可漏放，不能把所有人挡在门外。
+      this.ipHits = new Map();
+      this.ipDaily = new Map();
+    }
+    this.ipHitsLoaded = true;
+  }
+
+  /** 把裁剪后的窗口写回 storage。失败只记日志，不影响放行结果。 */
+  async persistIpHits() {
+    const now = getTime();
+    // 一并清理窗口外已经全空的条目 —— 否则「来过一次就再没来的 IP」会永久占着
+    // storage，表只会单向增长。
+    const alive = {};
+    for (const [ip, hits] of this.ipHits) {
+      const fresh = hits.filter((t) => now - t < this.config.connWindowMs);
+      if (fresh.length > 0) alive[ip] = fresh;
+    }
+    // 日计数：只留今天的。过了一天就归零 —— 用 UTC 日界而不是本地时区，
+    // 免得跟着运营商/机器时区漂。
+    const today = dayKey(now);
+    const daily = {};
+    for (const [ip, rec] of this.ipDaily) {
+      if (rec && rec.d === today) daily[ip] = rec;
+    }
+
+    try {
+      await this.state.storage.put({ ipRate: alive, ipDaily: daily });
+    } catch (error) {
+      logEvent('ratelimit-persist', error, 'error');
+    }
+  }
+
+  allowConnection(ip) {
+    // 拿不到 IP 就放行。这条路径上 cf-connecting-ip 一定存在（Cloudflare 注入），
+    // 真为空说明是异常请求 —— 宁可放过一次，也不要因为判据缺失把所有人挡在外面。
+    if (!ip) return true;
+
+    const now = getTime();
+
+    // ① 日上限。跨天就重置 —— 存的是日期字符串，比时间戳好读、也不会被闰秒之类的影响。
+    const today = dayKey(now);
+    const dayRec = this.ipDaily.get(ip);
+    const dayCount = dayRec && dayRec.d === today ? dayRec.n : 0;
+    if (dayCount >= this.config.maxConnPerIpPerDay) {
+      return false;                // 跨天了不写回，留着让 persist 清掉
+    }
+
+    // ② 分钟窗口。
+    const hits = (this.ipHits.get(ip) || []).filter((t) => now - t < this.config.connWindowMs);
+    if (hits.length >= this.config.maxConnPerMinute) {
+      this.ipHits.set(ip, hits);   // 写回裁剪后的数组，别让窗口外的旧时间戳一直占着
+      return false;
+    }
+
+    // 两条都过了才记账 —— 被拒的那次不该占用配额。
+    hits.push(now);
+    this.ipHits.set(ip, hits);
+    this.ipDaily.set(ip, { d: today, n: dayCount + 1 });
+    this.pruneIpHits(now);
+    return true;
+  }
+
+  /** 只在表太大时才做全表清理：正常规模下没必要每次都遍历。 */
+  pruneIpHits(now) {
+    if (this.ipHits.size <= this.config.maxTrackedIps) return;
+    for (const [ip, hits] of this.ipHits) {
+      if (!hits.some((t) => now - t < this.config.connWindowMs)) {
+        this.ipHits.delete(ip);
+      }
+    }
+  }
+
   async fetch(request) {
+    // 举报收件箱的内部端点。**只由 Worker 转发进来**（公网无法直达 DO 实例），
+    // 所以这里不再重复鉴权 —— 鉴权在 Worker 层（见 handleAdminReports）。
+    const path = new URL(request.url).pathname;
+    if (path === '/internal/report') {
+      return this.handleReportSubmit(request);
+    }
+    if (path === '/internal/reports') {
+      if (request.method === 'DELETE') {
+        await this.state.storage.delete('reports');
+        return Response.json({ ok: true, cleared: true });
+      }
+      const stored = await this.state.storage.get('reports');
+      return Response.json({ reports: stored || [] });
+    }
+
     // Check for WebSocket upgrade
     const upgradeHeader = request.headers.get('Upgrade');
     if (!upgradeHeader || upgradeHeader !== 'websocket') {
       return new Response('Expected WebSocket Upgrade', { status: 426 });
+    }
+
+    // IP 级建连频率限制。放在**创建 socket 之前** —— 被拒的连接不该占用 socket、
+    // 不该触发密钥协商，更不该开始计 DO 时长。
+    //
+    // 测试通道豁免：本项目的自动化脚本（room-scale 压 150 连接、e2e-worker）本来就从
+    // 同一个出口 IP 开上百条连接，被拦就没法测了。这个标志由 Worker 侧根据
+    // TURNSTILE_BYPASS 校验结果设置，并且**转发前先 delete 掉同名头**，
+    // 所以客户端伪造不了（见 worker/index.js 里 WS 分支的转发处）。
+    const ip = request.headers.get('cf-connecting-ip') || '';
+    const isTestChannel = request.headers.get('x-nc-test-channel') === '1';
+    if (!isTestChannel) {
+      await this.loadIpHits();
+      if (!this.allowConnection(ip)) {
+        logEvent('ratelimit-conn', ip, 'error');
+        return new Response('连接过于频繁，请等一分钟再试。', {
+          status: 429,
+          headers: {
+            'content-type': 'text/plain; charset=utf-8',
+            'retry-after': '60',
+          },
+        });
+      }
+      // 放行了才落盘 —— 被拒的连接不该产生写。
+      await this.persistIpHits();
+    }
+
+    // 全站并发保险丝。数活着的 socket —— DO 被驱逐过这个数依然可信
+    // （socket 由运行时托管，不随内存消失）。放在 RSA 初始化之前，最便宜。
+    const liveSockets = this.state.getWebSockets();
+    if (liveSockets.length >= this.config.maxTotalMembers) {
+      logEvent('total-cap-reached', [liveSockets.length, this.config.maxTotalMembers], 'error');
+      return new Response('服务当前连接数已达上限，请稍后再试。', {
+        status: 503,
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      });
     }
 
     // Ensure RSA keys are initialized
@@ -555,6 +1124,16 @@ export class ChatRoom {
 
     try {
       const channel = decrypted.p;
+      const members = this.channels[channel] || [];
+
+      // 房间已满就拒绝。数的是**频道内活着的成员** —— 每次进到 DO 都先跑过
+      // syncClients()，channels 是从 socket 的 attachment 重建的，所以这个数
+      // 既准又伪造不了（客户端自称的名单一概不采信）。
+      if (members.length >= this.config.maxRoomMembers) {
+        logEvent('room-full', [channel, members.length, this.config.maxRoomMembers]);
+        await this.rejectJoin(clientId, 'room-full', this.config.maxRoomMembers);
+        return;
+      }
 
       client.channel = channel;
       this.updateAttachment(client.connection, { channel });
@@ -569,6 +1148,35 @@ export class ChatRoom {
 
     } catch (error) {
       logEvent('message-join', [clientId, error], 'error');
+    }
+  }
+
+  /**
+   * 拒绝入房：先把理由发出去，再主动断开。**顺序不能反** ——
+   * WebSocket 保证有序，先发后断客户端才收得到；反过来客户端只看到「莫名其妙
+   * 被断开」，会触发它自己的自动重连（reconnectDelay 3s），把满房间反复撞。
+   *
+   * 客户端收到 a='err' 后置 _rejected 标志、停在失败态不再重连
+   * （见 NodeCrypt.js 的 err 分支与 room.js 的 onServerError）。
+   */
+  async rejectJoin(clientId, code, limit) {
+    const client = this.clients[clientId];
+    if (!client) return;
+
+    try {
+      const key = await this.getSharedKey(clientId);
+      if (key) {
+        const encrypted = await encryptMessage({ a: 'err', code, p: limit }, key);
+        this.sendMessage(client.connection, encrypted);
+      }
+    } catch (error) {
+      logEvent('reject-join-send', error, 'error');
+    }
+
+    try {
+      client.connection.close(4001, code);
+    } catch (error) {
+      logEvent('reject-join-close', error, 'error');
     }
   }
 

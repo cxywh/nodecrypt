@@ -259,16 +259,9 @@ async function decompressVolumesToFile(volumes, fileName, originalHash = null) {
 					}
 				}
 				
-				// Create blob and download
-				const blob = new Blob([decompressed]);
-				const url = URL.createObjectURL(blob);
-				const a = document.createElement('a');
-				a.href = url;
-				a.download = fileName;
-				document.body.appendChild(a);
-				a.click();
-				document.body.removeChild(a);
-				URL.revokeObjectURL(url);
+				// 走统一的保存入口：浏览器里是 <a download>，安卓壳里转原生桥。
+				// 这里原来是内联的 blob + <a download>，在 WebView 里会静默失效。
+				saveBlob(new Blob([decompressed]), fileName);
 				
 				resolve();
 			});
@@ -339,16 +332,8 @@ async function decompressArchiveToFiles(volumes, fileManifest, archiveHash = nul
 					const fileData = decompressed.slice(dataOffset, dataOffset + fileSize);
 					dataOffset += fileSize;
 					
-					// Create and download file
-					const blob = new Blob([fileData]);
-					const url = URL.createObjectURL(blob);
-					const a = document.createElement('a');
-					a.href = url;
-					a.download = fileName;
-					document.body.appendChild(a);
-					a.click();
-					document.body.removeChild(a);
-					URL.revokeObjectURL(url);
+					// 同上：统一走 saveBlob，否则壳里这条解压后保存的路径同样失效
+					saveBlob(new Blob([fileData]), fileName);
 					
 					extractedFiles.push(fileName);
 					

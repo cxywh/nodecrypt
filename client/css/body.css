@@ -251,6 +251,20 @@ body {
 	transform: translateY(1px);
 }
 
+/* Turnstile 人机验证的挂载点。
+   未启用时这个 div 是空的，必须做到**完全不可见且不占位** ——
+   否则没开通验证的部署会凭空多出一条空白。
+   启用后 Turnstile 会往里塞一个 iframe（managed 模式约 65px 高）。 */
+.turnstile-slot:empty {
+	display: none;
+}
+
+.turnstile-slot {
+	display: flex;
+	justify-content: center;
+	margin-top: 12px;
+}
+
 /* 连接状态行：阶段 + 已等待秒数。
    秒数是这里的重点 —— 实测国内到 Cloudflare 的 wss 握手在 0.5~10 秒之间抖动，
    只有一句静态的「连接中...」无法区分「正在连」和「已经卡死」。 */

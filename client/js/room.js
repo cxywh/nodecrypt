@@ -145,6 +145,13 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 		}
 	}
 	const callbacks = {
+		// 取 Turnstile token 期间切到不计时的 stage：这段等的是人，不是网。
+		// 拿回 token 后 status.start() 会重新起算，秒数不会把点击耗时算进去。
+		onVerifyNeeded: () => status.waitForVerify(),
+		onVerifyDone: () => status.start(),
+		// 验证没完成：报一个明确的失败（不是「连接失败」——那次根本没去连），
+		// 并把按钮交还给用户，让他重新点「确定」拿一枚新挑战。
+		onVerifyFailed: () => { status.fail('verify'); settle(false); },
 		// WebSocket 握手成功 —— 网络这一段结束，接下来是密钥协商。
 		// 分开报是为了让用户知道慢在哪一段。
 		onSocketOpen: () => status.advance(STAGE.CRYPTO),
@@ -173,6 +180,17 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 			}
 			settle(true);
 			addSystemMsg(t('system.secured', 'connection secured'))
+		},
+		// 服务端业务拒绝（房间满）。不是网络故障 —— 直接停在失败态、把原因
+		// 说清楚，绝不重连（NodeCrypt 侧已置 _rejected）。fail() 是幂等的，
+		// 紧随其后的 onServerClosed 不会再改这条文案。
+		onServerError: (code, limit) => {
+			if (code === 'room-full') {
+				status.fail(t('system.room_full', 'Room is full (limit ' + limit + ')'))
+			} else {
+				status.fail(code || 'server rejected')
+			}
+			settle(false)
 		},
 		onClientSecured: (user) => handleClientSecured(idx, user),
 		onClientList: (list, selfId) => handleClientList(idx, list, selfId),

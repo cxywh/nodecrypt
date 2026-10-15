@@ -74,7 +74,7 @@ check('start() 进入 NET 阶段并立刻渲染一次', () => {
 	eq(renders[0].seconds, 0);
 });
 
-check('★ 秒数随时间增长（这是「没卡死」的唯一证据）', () => {
+check('秒数随时间增长（这是「没卡死」的唯一证据）', () => {
 	const { st, clock, renders } = makeStatus();
 	st.start();
 	clock.tick(1); eq(st.elapsed, 1, '1 秒后');
@@ -95,7 +95,7 @@ check('advance 到 CRYPTO（已连上服务器，正在协商加密）', () => {
 	eq(st.stage, STAGE.CRYPTO);
 });
 
-check('★ 超过 SLOW_AFTER 秒置 slow 位（用于提示「网络较慢，仍在尝试」）', () => {
+check('超过 SLOW_AFTER 秒置 slow 位（用于提示「网络较慢，仍在尝试」）', () => {
 	const { st, clock } = makeStatus();
 	st.start();
 	clock.tick(SLOW_AFTER - 1);
@@ -124,6 +124,64 @@ check('finish() 进入 READY 并冻结秒数', () => {
 	eq(st.state().slow, false, '已连上就不该再提示慢');
 });
 
+console.log('\n【1.5】人机验证阶段（等的是人，不是网）');
+// 这一节的起因：Turnstile 挂件要用户手动去点，而 start() 一进 NET 就起算秒表。
+// 于是「等人」的时长被算成了网络耗时 —— 状态行报「网络较慢，仍在尝试」
+// 是在冤枉用户的网，到 FAIL_AFTER 秒还会直接判超时，等于催人。
+
+check('waitForVerify() 进入 VERIFY 阶段', () => {
+	const { st } = makeStatus();
+	st.start();
+	st.waitForVerify();
+	eq(st.stage, STAGE.VERIFY);
+});
+
+check('VERIFY 阶段秒数恒为 0（用户还没动手，不该报耗时）', () => {
+	const { st, clock } = makeStatus();
+	st.start();
+	st.waitForVerify();
+	eq(st.state().seconds, 0, '刚进入时');
+	clock.tick(20);
+	eq(st.state().seconds, 0, '等 20 秒后仍应为 0');
+});
+
+check('VERIFY 阶段不置 slow 位（否则「网络较慢」是冤枉用户的网）', () => {
+	const { st, clock } = makeStatus();
+	st.start();
+	st.waitForVerify();
+	clock.tick(SLOW_AFTER + 5);
+	eq(st.state().slow, false);
+});
+
+check('VERIFY 阶段永不判超时（人可能要想半天，不能替他判死）', () => {
+	const { st, clock, timeouts } = makeStatus();
+	st.start();
+	st.waitForVerify();
+	clock.tick(FAIL_AFTER * 3);
+	eq(st.stage, STAGE.VERIFY, '不该被判成 failed');
+	eq(timeouts.length, 0, '不该触发 onTimeout');
+});
+
+check('VERIFY 阶段定时器已停（不留每秒空跑的 interval）', () => {
+	const { st, clock } = makeStatus();
+	st.start();
+	assert(clock.pending() > 0, 'start 之后应当有定时器');
+	st.waitForVerify();
+	eq(clock.pending(), 0, 'waitForVerify 应当把定时器停掉');
+});
+
+check('拿回 token 后 start() 重新起算，点击耗时不算进网络耗时', () => {
+	const { st, clock } = makeStatus();
+	st.start();
+	st.waitForVerify();
+	clock.tick(60);   // 用户磨蹭了一分钟才点那个复选框
+	st.start();       // token 到手，真正开始连
+	eq(st.stage, STAGE.NET);
+	eq(st.state().seconds, 0, '网络计时必须从这一刻从 0 开始');
+	clock.tick(2);
+	eq(st.state().seconds, 2);
+});
+
 console.log('\n【2】失败路径（这次要修的 bug 就在这里）');
 
 check('fail() 记录原因并冻结秒数', () => {
@@ -138,7 +196,7 @@ check('fail() 记录原因并冻结秒数', () => {
 	eq(st.elapsed, 4, '失败后秒数不该继续涨');
 });
 
-check('★ fail() 幂等：onError 和 onClose 先后都触发也只算一次', () => {
+check('fail() 幂等：onError 和 onClose 先后都触发也只算一次', () => {
 	const { st, clock } = makeStatus();
 	st.start();
 	clock.tick(3);
@@ -148,7 +206,7 @@ check('★ fail() 幂等：onError 和 onClose 先后都触发也只算一次', 
 	eq(st.error, 'error', '第一次的原因应当保留');
 });
 
-check('★ 结束之后迟到的 advance 不生效（否则界面会被改回「连接中」）', () => {
+check('结束之后迟到的 advance 不生效（否则界面会被改回「连接中」）', () => {
 	const { st } = makeStatus();
 	st.start();
 	st.fail('closed');
@@ -162,7 +220,7 @@ check('★ 结束之后迟到的 advance 不生效（否则界面会被改回「
 	eq(b.st.stage, STAGE.READY, '成功后同理');
 });
 
-check('★ 成功之后迟到的 fail 不生效（连上再断线是另一回事）', () => {
+check('成功之后迟到的 fail 不生效（连上再断线是另一回事）', () => {
 	const { st, clock } = makeStatus();
 	st.start();
 	clock.tick(2);
@@ -173,7 +231,7 @@ check('★ 成功之后迟到的 fail 不生效（连上再断线是另一回事
 	eq(st.elapsed, 2, '秒数应停在成功那一刻');
 });
 
-check('★ 超时自动判失败并回调 onTimeout（不能无限等）', () => {
+check('超时自动判失败并回调 onTimeout（不能无限等）', () => {
 	const { st, clock, timeouts } = makeStatus();
 	st.start();
 	clock.tick(FAIL_AFTER - 1);
@@ -187,7 +245,7 @@ check('★ 超时自动判失败并回调 onTimeout（不能无限等）', () =>
 	eq(timeouts.length, 1, '不该重复触发');
 });
 
-check('★ onTimeout 里抛错不会打断（但会被记到 console.error）', () => {
+check('onTimeout 里抛错不会打断（但会被记到 console.error）', () => {
 	const clock = makeClock();
 	const origError = console.error;
 	let logged = 0;
@@ -209,7 +267,7 @@ check('★ onTimeout 里抛错不会打断（但会被记到 console.error）', 
 	}
 });
 
-check('★ 渲染回调抛错不会打断连接流程，且必须可见', () => {
+check('渲染回调抛错不会打断连接流程，且必须可见', () => {
 	const clock = makeClock();
 	const origError = console.error;
 	let logged = 0;

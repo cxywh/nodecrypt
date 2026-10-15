@@ -442,7 +442,29 @@ export async function downloadFromR2(manifest, { onProgress, signal } = {}) {
 // 保存到本地
 // ---------------------------------------------------------------------------
 
-export function saveBlob(blob, fileName) {
+/** 原生壳注入的桥对象名，必须与安卓侧 MainActivity 的 BRIDGE_NAME 一致。 */
+const NATIVE_BRIDGE_NAME = 'NCryptNative';
+
+/** 分块 256 KiB —— 与文件分卷同量级，是已经验证过的尺寸。 */
+const NATIVE_CHUNK_BYTES = 256 * 1024;
+
+function nativeBridge() {
+	if (typeof window === 'undefined') {
+		return null
+	}
+	const bridge = window[NATIVE_BRIDGE_NAME];
+	if (!bridge || typeof bridge.begin !== 'function' || typeof bridge.chunk !== 'function' || typeof bridge.finish !== 'function') {
+		return null
+	}
+	return bridge
+}
+
+/** 当前是否跑在安卓壳里（而不是浏览器）。 */
+export function isNativeShell() {
+	return nativeBridge() !== null
+}
+
+function saveBlobInBrowser(blob, fileName) {
 	const url = URL.createObjectURL(blob);
 	const a = document.createElement('a');
 	a.href = url;
@@ -452,4 +474,72 @@ export function saveBlob(blob, fileName) {
 	document.body.removeChild(a);
 	// 立刻 revoke 会让部分浏览器来不及取数据，延后释放
 	setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+/**
+ * 走原生桥写进系统「下载」目录。
+ *
+ * 必须分块：一次性把整个文件当 base64 传过桥，Java 侧收到的是 UTF-16 字符串，
+ * 内存占用约等于文件体积的 2.7 倍（base64 1.33 × UTF-16 2），传 20 MB 就要 50 MB+。
+ */
+async function saveBlobViaBridge(bridge, blob, fileName) {
+	let writing = false;
+	try {
+		const beginResult = bridge.begin(fileName, blob.type || 'application/octet-stream', blob.size);
+		if (beginResult !== 'ok') {
+			throw new Error(beginResult)
+		}
+		writing = true;
+
+		for (let offset = 0; offset < blob.size; offset += NATIVE_CHUNK_BYTES) {
+			const part = blob.slice(offset, offset + NATIVE_CHUNK_BYTES);
+			const bytes = new Uint8Array(await part.arrayBuffer());
+			const chunkResult = bridge.chunk(toB64(bytes));
+			if (chunkResult !== 'ok') {
+				throw new Error(chunkResult)
+			}
+		}
+
+		const finishResult = bridge.finish();
+		if (finishResult !== 'ok') {
+			throw new Error(finishResult)
+		}
+		writing = false;
+		if (window.addSystemMsg) {
+			window.addSystemMsg('已保存到「下载」：' + fileName)
+		}
+	} catch (error) {
+		// 中途失败必须把半截文件删掉，否则用户在「下载」里看到一个损坏的文件，
+		// 而且完全不知道它是坏的。
+		if (writing) {
+			try {
+				bridge.abort()
+			} catch (abortError) {
+				console.error('native abort failed:', abortError)
+			}
+		}
+		console.error('saveBlob via native bridge failed:', error);
+		const reason = String(error && error.message ? error.message : error).replace(/^err:/, '');
+		if (window.addSystemMsg) {
+			window.addSystemMsg('保存失败：' + reason)
+		}
+	}
+}
+
+/**
+ * 保存一个 blob 为文件。
+ *
+ * 浏览器里是 `<a download>` + blob: URL；**安卓壳里必须走原生桥** ——
+ * WebView 的 DownloadListener 只对 http/https 这类可解析的 URL 触发，
+ * `blob:` 会被静默忽略：用户点「保存」什么都不发生，也不报任何错。
+ *
+ * 本函数不 reject（错误已在内部转成界面提示），所以调用方可以不 await。
+ */
+export function saveBlob(blob, fileName) {
+	const bridge = nativeBridge();
+	if (!bridge) {
+		saveBlobInBrowser(blob, fileName);
+		return Promise.resolve()
+	}
+	return saveBlobViaBridge(bridge, blob, fileName)
 }

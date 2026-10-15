@@ -22,6 +22,7 @@
 //      把逻辑抽成纯函数式的类，才能在 Node 里直接单测这条路径。
 
 export const STAGE = {
+	VERIFY: 'verify',  // 等人机验证（Turnstile）—— 等的是人，不是网，不计时
 	NET: 'net',        // TCP/TLS + WebSocket 握手（最慢的一段）
 	CRYPTO: 'crypto',  // 服务端密钥协商 + 对端密钥交换
 	READY: 'ready',
@@ -58,6 +59,27 @@ export class ConnectStatus {
 		this.stoppedAt = null;
 		this.error = null;
 		this._timerId = null;
+	}
+
+	/**
+	 * 进入「等待用户完成人机验证」阶段。
+	 *
+	 * 这一段**刻意不计时**：长短取决于用户什么时候动手点那个复选框，
+	 * 把它算进网络耗时会同时犯两个错 —— 一边显示「网络较慢，仍在尝试」
+	 * 冤枉用户的网，一边在 FAIL_AFTER 秒后直接判超时，等于催人。
+	 *
+	 * startedAt 置空，state() 里 seconds 因此恒为 0、slow 恒为 false；
+	 * 定时器一并停掉（超时判定依据的是 elapsed，置空后本来也判不动，
+	 * 但不停掉就是白跑一个每秒的定时器）。
+	 */
+	waitForVerify() {
+		this._disarm();
+		this.startedAt = null;
+		this.stoppedAt = null;
+		this.stage = STAGE.VERIFY;
+		this.error = null;
+		this._emit();
+		return this;
 	}
 
 	/** 开始等待。从 STAGE.NET 起算，并启动每秒一次的秒数刷新。 */

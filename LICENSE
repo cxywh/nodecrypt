@@ -13,3 +13,16 @@ ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
 WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
 ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+================================================================================
+本仓库是上述项目的 fork。
+
+上游部分：Copyright (c) 2024, NodeCrypt —— 以上 ISC 许可原文照录，未作改动。
+fork 新增部分（人机验证、服务端限流、来源白名单、举报收件箱、安卓套壳等）：
+Copyright (c) 2026, cxywh —— 同样以 ISC 许可发布。
+
+保留上游版权声明是本许可的硬性要求，不是可选项：任何人都可以自由使用、修改、
+分发（含商用、含闭源再分发），但必须保留上面的版权声明与许可文本。
+
+自建部署、许可选择、以及「不要把本实例当你的后端」等边界，见 NOTICE.md。
+================================================================================

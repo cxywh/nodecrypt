@@ -160,7 +160,7 @@ All cryptographic primitives come from the browser-native **Web Crypto API**. No
 
 The third-party crypto libraries used by the original version (`elliptic`, `aes-js`, `js-chacha20`, `js-sha256`) have all been removed.
 
-## ⚠️ Known Limitations
+## Note: Known Limitations
 
 1. **Does not defend against a replaced client**
    The entire end-to-end implementation lives in client-side JS (`client/js/aead.js`). If an attacker can tamper with that JS, no amount of cryptography helps — the backdoored copy will simply hand over the keys. **Only load the client from a deployment you trust.**
@@ -201,7 +201,7 @@ Network packet capture tools can verify that all WebSocket transmitted data is u
 ### Code Security Audit
 All encryption-related code is completely open source, using standard cryptographic algorithms. Security researchers are welcome to conduct independent audits.
 
-## ⚠️ Security Recommendations
+## Note: Security Recommendations
 
 - **Use Strong Room Passwords**: Room passwords directly affect end-to-end encryption strength; complex passwords are recommended
 - **Password Confidentiality**: If a room password is leaked, all communication content in that room may be decrypted
@@ -215,7 +215,7 @@ Security researchers are welcome to report vulnerabilities and conduct security 
 
 This project uses the ISC open source license.
 
-## ⚠️ Disclaimer
+## Note: Disclaimer
 
 This project is for educational and technical research purposes only and must not be used for any illegal or criminal activities. Users should comply with the relevant laws and regulations of their country and region. The project author assumes no legal responsibility for any consequences arising from the use of this software. Please use this project legally and compliantly.
 

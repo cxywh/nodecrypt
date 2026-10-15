@@ -1857,6 +1857,34 @@ flex-direction: column;
   text-decoration: underline;
 }
 
+/* 服务条款 / 举报入口。
+   放在登录页底部而不是聊天界面里：举报入口必须**不登录也能看到** ——
+   被骚扰的人可能连房间都不想再进，或者在门口就遇到了问题。
+   也不放进翻转卡片的帮助页，那样要用户先发现「帮助」按钮才找得到。 */
+.legal-links {
+  text-align: center;
+  font-size: 13px;
+  color: #c1c1c1;
+  margin: 20px 0 0 0;
+  letter-spacing: 0.2px;
+}
+
+.legal-links a {
+  color: #30a8f7;
+  text-decoration: none;
+}
+
+.legal-links a:hover {
+  text-decoration: underline;
+}
+
+.legal-sep {
+  margin: 0 8px;
+  /* 跟父级同一个弱化色。先前写 #ddd 在白底上几乎看不见，
+     视觉验收时被判成「分隔符缺失」。 */
+  color: #c1c1c1;
+}
+
 
 h2{
 	margin: 0%;

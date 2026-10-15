@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<meta name="robots" content="noindex,nofollow">
+	<title>举报滥用 - NodeCrypt</title>
+	<meta name="description" content="举报本站加密聊天服务中的违法内容或骚扰行为。">
+	<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+	<style>
+		:root {
+			--accent: #30a8f7;
+			--text: #333;
+			--text-strong: #2D3748;
+			--muted: #666;
+			--line: #e3e6ea;
+			--bg-soft: #fafbfc;
+			--ok: #2e9e5b;
+			--err: #d64545;
+		}
+		* { box-sizing: border-box; }
+		body {
+			margin: 0;
+			padding: 0 16px 64px;
+			background: #fff;
+			color: var(--text);
+			font-family: 'Roboto', Arial, 'Microsoft YaHei', sans-serif;
+			font-size: 15px;
+			line-height: 1.75;
+			-webkit-text-size-adjust: 100%;
+		}
+		.wrap { max-width: 680px; margin: 0 auto; }
+		header { padding: 32px 0 20px; border-bottom: 1px solid var(--line); margin-bottom: 26px; }
+		h1 { font-size: 24px; margin: 0 0 8px; color: var(--text-strong); font-weight: 600; }
+		.sub { color: var(--muted); font-size: 14px; margin: 0; }
+		h2 { font-size: 17px; margin: 30px 0 10px; color: var(--text-strong); font-weight: 600;
+			padding-left: 11px; border-left: 3px solid var(--accent); }
+		p { margin: 10px 0; }
+		ul { margin: 10px 0; padding-left: 22px; }
+		li { margin: 6px 0; }
+		a { color: var(--accent); text-decoration: none; }
+		a:hover { text-decoration: underline; }
+		strong { color: var(--text-strong); }
+		code { background: var(--bg-soft); border: 1px solid var(--line); border-radius: 3px;
+			padding: 1px 5px; font-size: 13px; font-family: Consolas, Monaco, monospace; }
+
+		.callout {
+			background: var(--bg-soft);
+			border: 1px solid var(--line);
+			border-left: 3px solid var(--accent);
+			border-radius: 4px;
+			padding: 14px 16px;
+			margin: 18px 0;
+		}
+		.callout p:first-child { margin-top: 0; }
+		.callout p:last-child { margin-bottom: 0; }
+
+		form { margin: 18px 0 0; }
+		.field { margin-bottom: 16px; }
+		label { display: block; font-size: 14px; font-weight: 600; color: var(--text-strong); margin-bottom: 5px; }
+		.hint { font-size: 13px; color: var(--muted); font-weight: 400; margin-left: 6px; }
+		input[type="text"], textarea {
+			width: 100%;
+			padding: 9px 11px;
+			border: 1px solid var(--line);
+			border-radius: 4px;
+			font-size: 14px;
+			font-family: inherit;
+			color: var(--text);
+			background: #fff;
+			transition: border-color 0.2s ease, box-shadow 0.2s ease;
+		}
+		input[type="text"]:focus, textarea:focus {
+			outline: none;
+			border-color: var(--accent);
+			box-shadow: 0 0 0 3px rgba(48, 168, 247, 0.12);
+		}
+		textarea { min-height: 130px; resize: vertical; line-height: 1.65; }
+		.required { color: var(--err); }
+
+		.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; align-items: center; }
+		button {
+			padding: 10px 22px;
+			border-radius: 4px;
+			font-size: 14px;
+			font-family: inherit;
+			cursor: pointer;
+			border: 1px solid var(--accent);
+			background: var(--accent);
+			color: #fff;
+			transition: background-color 0.2s ease, color 0.2s ease, opacity 0.2s ease;
+		}
+		button:hover:not(:disabled) { background: #1d97e6; border-color: #1d97e6; }
+		button.ghost { background: #fff; color: var(--accent); }
+		button.ghost:hover:not(:disabled) { background: var(--bg-soft); }
+		button:disabled { opacity: 0.55; cursor: default; }
+
+		.status { margin-top: 14px; font-size: 14px; min-height: 22px; font-weight: 500; }
+		.status.ok { color: var(--ok); }
+		.status.err { color: var(--err); }
+		.status.info { color: var(--muted); font-weight: 400; }
+
+		.fallback { margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--line); }
+		.fallback h2 { margin-top: 0; }
+
+		footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line);
+			color: var(--muted); font-size: 13px; }
+		.back { display: inline-block; margin-top: 6px; padding: 9px 18px; border: 1px solid var(--accent);
+			border-radius: 4px; color: var(--accent); }
+		.back:hover { background: var(--accent); color: #fff; text-decoration: none; }
+	</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+	<h1>举报滥用</h1>
+	<p class="sub">举报本站加密聊天服务中的违法内容或骚扰行为 · 适用于 <code>chat.cxywh.cn</code></p>
+</header>
+
+<div class="callout">
+	<p><strong>先看这一条，能省你很多时间</strong>：本站是端到端加密的，<strong>服务器读不到任何聊天内容</strong>。管理员没有「后台可以查聊天记录」这种东西。</p>
+	<p>所以举报能不能被处理，几乎完全取决于你提供的证据。<strong>截图是最关键的</strong> —— 没有截图，我们通常只能按 IP 封禁，效果非常有限。</p>
+</div>
+
+<h2>提交前请准备好</h2>
+<ul>
+	<li><strong>截图</strong>（最重要）。请截下对方发送的违法/骚扰内容，尽量带上对方的昵称和时间。</li>
+	<li><strong>房间名</strong>，或者你进入房间时的完整链接。</li>
+	<li><strong>对方的显示昵称</strong>。</li>
+	<li><strong>事发时间</strong>，尽量精确到分钟。</li>
+	<li><strong>一个能联系到你的方式</strong>（可选）。只在需要补充证据时使用，不会公开。</li>
+</ul>
+
+<h2>提交举报</h2>
+<form id="report-form" autocomplete="off">
+	<div class="field">
+		<label for="f-room">房间名或房间链接 <span class="hint">没记住可以留空</span></label>
+		<input type="text" id="f-room" name="room" maxlength="200" placeholder="例如 3班班级群 或完整链接">
+	</div>
+	<div class="field">
+		<label for="f-peer">对方显示昵称 <span class="hint">没看清可以留空</span></label>
+		<input type="text" id="f-peer" name="peer" maxlength="200" placeholder="例如 张三">
+	</div>
+	<div class="field">
+		<label for="f-when">事发时间 <span class="hint">尽量精确</span></label>
+		<input type="text" id="f-when" name="when" maxlength="200" placeholder="例如 2026-10-15 20:30 左右">
+	</div>
+	<div class="field">
+		<label for="f-detail">具体情况 <span class="required">必填</span> <span class="hint">至少 10 个字</span></label>
+		<textarea id="f-detail" name="detail" maxlength="2000"
+			placeholder="请描述发生了什么。如果内容涉及违法信息，请尽量原样复述被举报的内容（服务器读不到消息，只能靠你转述）。"></textarea>
+	</div>
+	<div class="field">
+		<label for="f-contact">你的联系方式 <span class="hint">可选，仅管理员可见</span></label>
+		<input type="text" id="f-contact" name="contact" maxlength="200" placeholder="邮箱 / 其他，用于需要补充证据时联系你">
+	</div>
+
+	<div class="actions">
+		<button type="submit" id="btn-submit">提交举报</button>
+		<button type="button" class="ghost" id="btn-copy">复制举报内容</button>
+	</div>
+	<div class="status info" id="status">截图请通过你与管理员约定的方式单独提供 —— 本表单只接收文字。</div>
+</form>
+
+<div class="fallback">
+	<h2>如果提交失败</h2>
+	<p>请点上面的「复制举报内容」，把复制到的文本通过其他渠道发给管理员，并附上截图。举报内容不会因为提交失败而丢失 —— 它一直在你的输入框里。</p>
+</div>
+
+<footer>
+	<p>关于我们能做什么、不能做什么，见 <a href="/terms">服务条款</a> 第四、五节。</p>
+	<p><a class="back" href="/">返回聊天</a></p>
+</footer>
+
+</div>
+
+<script>
+(function () {
+	'use strict';
+
+	var form = document.getElementById('report-form');
+	var statusEl = document.getElementById('status');
+	var btnSubmit = document.getElementById('btn-submit');
+	var btnCopy = document.getElementById('btn-copy');
+
+	function setStatus(text, kind) {
+		statusEl.textContent = text;
+		statusEl.className = 'status ' + (kind || 'info');
+	}
+
+	function value(id) {
+		return document.getElementById(id).value.trim();
+	}
+
+	function collect() {
+		return {
+			room: value('f-room'),
+			peer: value('f-peer'),
+			when: value('f-when'),
+			detail: value('f-detail'),
+			contact: value('f-contact')
+		};
+	}
+
+	/** 复制兜底用的纯文本。字段都在，留空的用「(未提供)」占位，方便管理员一眼看出缺什么。 */
+	function asText(d) {
+		function or(v) { return v || '(未提供)'; }
+		return [
+			'=== 举报内容 ===',
+			'房间名/链接：' + or(d.room),
+			'对方昵称：' + or(d.peer),
+			'事发时间：' + or(d.when),
+			'我的联系方式：' + or(d.contact),
+			'',
+			'具体情况：',
+			or(d.detail),
+			'',
+			'（截图请单独提供）'
+		].join('\n');
+	}
+
+	form.addEventListener('submit', function (event) {
+		event.preventDefault();
+
+		var data = collect();
+		if (data.detail.length < 10) {
+			setStatus('请填写具体情况，至少 10 个字。', 'err');
+			document.getElementById('f-detail').focus();
+			return;
+		}
+
+		btnSubmit.disabled = true;
+		setStatus('正在提交...', 'info');
+
+		fetch('/api/report', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(data)
+		}).then(function (res) {
+			return res.json().then(function (body) { return { status: res.status, body: body }; });
+		}).then(function (r) {
+			if (r.body && r.body.ok) {
+				setStatus('已提交，感谢你的举报。管理员会尽快查阅处理。', 'ok');
+				form.reset();
+			} else if (r.body && r.body.error === 'too_many') {
+				setStatus('提交过于频繁，请一小时后再试；也可以点「复制举报内容」用其他渠道发给管理员。', 'err');
+			} else {
+				setStatus('提交失败，请点「复制举报内容」用其他渠道发给管理员。', 'err');
+			}
+		}).catch(function () {
+			setStatus('网络异常，提交失败。请点「复制举报内容」用其他渠道发给管理员。', 'err');
+		}).then(function () {
+			btnSubmit.disabled = false;
+		});
+	});
+
+	btnCopy.addEventListener('click', function () {
+		var text = asText(collect());
+
+		function done() { setStatus('举报内容已复制到剪贴板，请粘贴发送给管理员。', 'ok'); }
+		function failed() {
+			/* 剪贴板 API 在非 HTTPS 或部分浏览器下不可用 —— 退化到临时选中，
+			   让用户自己按 Ctrl+C。绝不静默失败。 */
+			var ta = document.createElement('textarea');
+			ta.value = text;
+			ta.style.position = 'fixed';
+			ta.style.left = '-9999px';
+			document.body.appendChild(ta);
+			ta.select();
+			var ok = false;
+			try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+			document.body.removeChild(ta);
+			if (ok) { done(); }
+			else { setStatus('复制失败，请手动选中下方内容复制。', 'err'); }
+		}
+
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			navigator.clipboard.writeText(text).then(done, failed);
+		} else {
+			failed();
+		}
+	});
+})();
+</script>
+
+</body>
+</html>

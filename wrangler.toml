@@ -25,7 +25,7 @@ new_sqlite_classes = ["ChatRoom"]
 # 对象名只含随机 blobId + 块号，不含文件名、不含任何用户信息 —— 服务端无法把
 # 对象关联到人，也解不开。
 #
-# ⚠️ 当前**故意注释掉**。
+# 注意：当前**故意注释掉**。
 #
 # 原因：R2 必须先在 Cloudflare 控制台绑定支付方式才能启用（免费额度也要绑卡）。
 # 桶不存在时部署会直接失败： code 10085 "R2 bucket not found"。
@@ -45,6 +45,37 @@ new_sqlite_classes = ["ChatRoom"]
 # [[r2_buckets]]
 # binding = "FILES"
 # bucket_name = "nodecrypt-files"
+
+# 注意：这里**故意没有** [[ratelimits]] binding。
+#
+# 本机线上实测（2026-10）：Workers Rate Limiting binding 在这个免费计划账号上
+# **部署能通过、limit() 能调用、不抛错，但在可用的阈值区间里不执法**：
+#
+#   limit=1  → 等窗口彻底重置后连打 10 次，第 7 次才出 429（101×6 → 429 → …）
+#   limit=30 → 同 IP 连打 200 次，**全部 101，一次没拦**
+#   limit=60 → 同 IP 连打 200 次，**全部 101，一次没拦**
+#
+# 同一批请求的 cf-connecting-ip 全是一致的 39.151.107.59（排除了「自家是多出口
+# NAT、请求分散到不同 IP」这个解释）。
+#
+# 原因就是官方自己说的：计数按 Cloudflare 机房**本地缓存**、异步向后端同步、
+# 刻意做成「宽松的、最终一致的，不是精确计费系统」。滞后在这一档阈值上大到
+# 使等值执法失效 —— 只有把 limit 压到 1 这种极端值才拦得住。
+#
+# 所以 IP 级限流改到 **ChatRoom Durable Object 里精确计数**（见 worker/index.js
+# 的 allowConnection），确定性、零额外成本，且洪水期间 DO 不会休眠、计数不会丢。
+
+# 运行期变量（非机密，会明文出现在 wrangler.toml 里，也会被 wrangler 打出来）
+[vars]
+# WebSocket 建连的**来源白名单**，逗号分隔。
+#
+# 这是开源后保护自己实例的关键一环：客户端公开后，别人可以 fork 一版、把连接地址
+# 改指到你的服务器白嫖你的免费额度。浏览器无法伪造 Origin，所以这一层能挡住
+# 「拿网页 fork 一版直连我」。它挡不住会自己写 Origin 头的脚本 —— 那一层由
+# Turnstile 负责（要求真实浏览器在你域名上解出挑战）。
+#
+# **留空 = 完全不校验**。自建者按自己的域名改这一行；忘了改就等于没该限制。
+ALLOWED_ORIGINS = "https://chat.cxywh.cn"
 
 # 自定义域：把 chat.cxywh.cn 绑到这个 Worker
 #

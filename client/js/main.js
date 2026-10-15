@@ -89,6 +89,9 @@ window.config = {
 	// 生产环境关掉 debug：开着的话 NodeCrypt 会把每条收到的帧打进控制台，
 	// 单条可达数百 KB，既刷屏（用户明确要求日志干净）又把用户数据落到控制台日志里。
 	// 需要排查时在地址栏加 ?debug=1；本地开发自动打开。
+	// Turnstile 人机验证的 sitekey（公开值，可以放在前端）。
+	// 留空 = 不启用，连接行为与接入前一致。widget 私钥在服务端 TURNSTILE_SECRET。
+	turnstileSitekey: '0x4AAAAAAFW4qOG4Iz-1nyQn',
 	debug: new URLSearchParams(window.location.search).has('debug') ||
 		/^(localhost|127\.0\.0\.1|\[::1\])$/.test(window.location.hostname)
 };

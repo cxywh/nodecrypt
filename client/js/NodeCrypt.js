@@ -27,6 +27,7 @@ import {
 	unpackBinaryFrame,
 	unpackVolumeRecord
 } from './aead.js';
+import { createTurnstileGate } from './util.turnstile.js';
 
 // Main NodeCrypt class for secure communication
 // 用于安全通信的 NodeCrypt 主类
@@ -40,7 +41,12 @@ class NodeCrypt {
 			reconnectDelay: config.reconnectDelay || 3000,
 			pingInterval: config.pingInterval || 20000,
 			debug: config.debug || false,
+			// Turnstile sitekey。由 main.js 注入；没配时 createTurnstileGate 返回空实现，
+			// 连接行为与接入前完全一致（本地开发 / 未开通 / 测试都走这条路）。
+			turnstileSitekey: config.turnstileSitekey || '',
 		};
+		// 人机验证闸门。enabled 为 false 时 getToken() 恒返回空串。
+		this.turnstile = createTurnstileGate(this.config.turnstileSitekey);
 		this.callbacks = {
 			onServerClosed: callbacks.onServerClosed || null,
 			onServerSecured: callbacks.onServerSecured || null,
@@ -48,12 +54,24 @@ class NodeCrypt {
 			onClientList: callbacks.onClientList || null,
 			onClientMessage: callbacks.onClientMessage || null,
 			onBinaryData: callbacks.onBinaryData || null,
+			// 新增：人在取 Turnstile token 期间的前后各一次。这段等的是人不是网，
+			// 界面要把它和「连服务器慢」分开说（见 util.connect.js 的 waitForVerify）。
+			// 注意：这里是**白名单逐项拷贝**，新回调不写进来就会被静默丢掉 ——
+			// 表现是回调一个都不触发、又完全不报错。
+			onVerifyNeeded: callbacks.onVerifyNeeded || null,
+			onVerifyDone: callbacks.onVerifyDone || null,
+			// 验证没拿到 token（超时/报错）：这次不该再去连，也不该自动重连。
+			onVerifyFailed: callbacks.onVerifyFailed || null,
 			// 新增：WebSocket 握手成功时回调。用来把「连服务器慢」和
 			// 「加密协商慢」区分开 —— 这两段在界面上该说不同的话。
 			onSocketOpen: callbacks.onSocketOpen || null,
 			// 新增：拿到服务端公钥指纹时回调（指纹, 是否与上次不同）
 			onServerKeyFingerprint: callbacks.onServerKeyFingerprint || null,
 		};
+		// 上一次 connect 是否因为「人机验证没拿到 token」而中止。
+		// 用来抑制自动重连 —— 重连会重进 getToken() -> reset()，把用户
+		// 正在点的验证挑战反复重置掉，结果是永远点不完（实测每 ~23 秒一轮）。
+		this._verifyIncomplete = false;
 		this.SERVER_KEY_STORAGE = 'nodecrypt_server_key_fingerprint';
 		this.serverKeys = null;
 		this.serverShared = null;
@@ -111,7 +129,21 @@ class NodeCrypt {
 
 	// Connect to the server
 	// 连接到服务器
-	connect() {
+	/**
+	 * 调一个可选回调。回调抛错**不该**打断连接流程 —— 但它必须可见：
+	 * 静默吞异常正是当初「连接失败按钮永远停在连接中」那个 bug 的成因。
+	 */
+	_notify(name) {
+		const fn = this.callbacks && this.callbacks[name];
+		if (typeof fn !== 'function') return;
+		try {
+			fn();
+		} catch (error) {
+			this.logEvent(name, error, 'error');
+		}
+	}
+
+	async connect() {
 		if (!this.credentials) {
 			return (false)
 		}
@@ -121,8 +153,37 @@ class NodeCrypt {
 		this.serverKeys = null;
 		this.serverShared = null;
 		this.channel = {};
+
+		// Turnstile：token **一次性**，服务端校验过即作废；而连接失败会 3 秒一次自动
+		// 重连（startReconnect）。所以这里每次都要现取一枚，不能缓存。取不到就给空串
+		// —— 服务端会拒（403），界面走既有的「连接失败 · 请重试」，不会卡在「连接中」。
+		let wsUrl = this.config.wsAddress;
+		if (this.turnstile && this.turnstile.enabled) {
+			// 取 token 可能要让用户去点验证框，时长完全不可控。先切到不计时的
+			// verify 阶段，拿回来再重新起算 —— 否则这段会被算成网络耗时，
+			// 状态行会显示「网络较慢，仍在尝试」并在 FAIL_AFTER 秒后判超时，
+			// 两样都是在冤枉用户（见 util.connect.js 的 waitForVerify）。
+			this._notify('onVerifyNeeded');
+			let token = '';
+			try {
+				token = await this.turnstile.getToken();
+			} catch (error) {
+				this.logEvent('turnstile-getToken', error, 'error');
+			}
+			this._notify('onVerifyDone');
+			// 没拿到 token 就别去连：服务端必然 403，而且 onClose/onError 里的自动
+			// 重连会每 3 秒重进一次 getToken()，把验证挑战反复 reset() 掉 ——
+			// 用户正在点的那个复选框会被一次次清空，永远点不完。
+			// 交给用户重新点「确定」去拿一枚全新的挑战。
+			this._verifyIncomplete = !token;
+			if (!token) {
+				this._notify('onVerifyFailed');
+				return false;
+			}
+			wsUrl += (wsUrl.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(token);
+		}
 		try {
-			this.connection = new WebSocket(this.config.wsAddress);
+			this.connection = new WebSocket(wsUrl);
 			// 二进制帧要以 ArrayBuffer 形式收 —— 浏览器默认给 Blob，那还得 await
 			// arrayBuffer() 转一道，白白多一次拷贝。批量数据走二进制通道，
 			// 见 aead.js 顶部「二进制通道」一节。
@@ -175,6 +236,9 @@ class NodeCrypt {
 		this.callbacks.onClientList = null;
 		this.callbacks.onClientMessage = null;
 		this.callbacks.onBinaryData = null;
+		this.callbacks.onVerifyNeeded = null;
+		this.callbacks.onVerifyDone = null;
+		this.callbacks.onVerifyFailed = null;
 		this.callbacks.onSocketOpen = null;
 		this.callbacks.onServerKeyFingerprint = null;
 		this.serverKeys = null;
@@ -307,6 +371,21 @@ class NodeCrypt {
 		if (!this.isObject(serverDecrypted) || !this.isString(serverDecrypted.a)) {
 			return
 		}
+		// 服务端业务拒绝（目前只有「房间已满」）。必须和网络故障分开处理：
+		// 网络故障该重连，业务拒绝重连只会再撞一次满房间。
+		if (serverDecrypted.a === 'err') {
+			this.logEvent('onMessage-server-error', serverDecrypted.code);
+			// 抑制自动重连（与 _verifyIncomplete 同一个套路）。
+			this._rejected = true;
+			if (this.callbacks.onServerError) {
+				try {
+					this.callbacks.onServerError(serverDecrypted.code, serverDecrypted.p)
+				} catch (error) {
+					this.logEvent('onServerError-callback', error, 'error')
+				}
+			}
+			return
+		}
 		if (serverDecrypted.a === 'l' && this.isArray(serverDecrypted.p)) {
 			try {
 				for (const clientId in this.channel) {
@@ -396,7 +475,7 @@ class NodeCrypt {
 		}
 		if (serverDecrypted.a === 'c' && this.channel[serverDecrypted.c] && this.channel[serverDecrypted.c].shared) {
 			const clientDecrypted = await this.decryptClientMessage(serverDecrypted.p, this.channel[serverDecrypted.c].shared);
-			// ★ 这里是**用户聊天内容的明文**。绝不能进日志 ——
+			// 这里是**用户聊天内容的明文**。绝不能进日志 ——
 			// debug 一开，用户说的每句话都会落在控制台里。
 			this.logEvent('onMessage-client-decrypted', this.isObject(clientDecrypted) ? 'a=' + clientDecrypted.a : typeof clientDecrypted);
 			if (!this.isObject(clientDecrypted) || !this.isString(clientDecrypted.a)) {
@@ -442,7 +521,7 @@ class NodeCrypt {
 	async onError(event) {
 		this.logEvent('onError', event, 'error');
 		this.disconnect();
-		if (this.credentials) {
+		if (this.credentials && !this._verifyIncomplete && !this._rejected) {
 			this.startReconnect()
 		}
 		if (this.callbacks.onServerClosed) {
@@ -459,7 +538,7 @@ class NodeCrypt {
 	async onClose(event) {
 		this.logEvent('onClose', event);
 		this.disconnect();
-		if (this.credentials) {
+		if (this.credentials && !this._verifyIncomplete && !this._rejected) {
 			this.startReconnect()
 		}
 		if (this.callbacks.onServerClosed) {

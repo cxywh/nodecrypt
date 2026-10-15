@@ -487,12 +487,14 @@ export function generateLoginForm(isModal = false) {
 			<input id="password${idPrefix}" type="password" autocomplete="${isModal ? 'off' : 'current-password'}" minlength="1" maxlength="15" placeholder="">
 			<label for="password${idPrefix}" class="floating-label">${t('ui.node_password', 'Room Password')} <span class="optional">${t('ui.optional', '(optional)')}</span></label>
 		</div>
+		<div class="turnstile-slot"></div>
 		<button type="submit" class="login-btn">${t('ui.enter', 'ENTER')}</button>
 		<div class="connect-status" id="connectStatus${idPrefix}" role="status" aria-live="polite" hidden></div>
 	`;
 }
 
 const CONNECT_STAGE_TEXT = {
+	verify: ['ui.connect_verify', 'Complete the human check'],
 	net: ['ui.connect_server', 'Connecting to server'],
 	crypto: ['ui.connect_crypto', 'Connected. Negotiating encryption']
 };
@@ -516,14 +518,28 @@ export function setConnectStatus(state) {
 		}
 		el.hidden = false;
 		if (state.stage === 'failed') {
+			const isVerify = state.error === 'verify';
 			const reason = state.error === 'timeout'
 				? t('ui.connect_timeout', 'Timed out')
-				: t('ui.connect_failed', 'Connection failed');
+				: isVerify
+					? t('ui.connect_verify_failed', 'Human check not completed')
+					: t('ui.connect_failed', 'Connection failed');
 			el.className = 'connect-status connect-status-failed';
-			el.textContent = `${reason} · ${state.seconds}s · ${t('ui.connect_retry', 'Please retry')}`;
+			// verify 这条不带秒数：那个 0s 是「等验证」的耗时（刻意不计时），
+			// 报出来没有信息量，还容易被读成「网络 0 秒就失败了」。
+			el.textContent = isVerify
+				? `${reason} · ${t('ui.connect_retry', 'Please retry')}`
+				: `${reason} · ${state.seconds}s · ${t('ui.connect_retry', 'Please retry')}`;
 			continue;
 		}
 		const [key, fallback] = CONNECT_STAGE_TEXT[state.stage] || CONNECT_STAGE_TEXT.net;
+		// 等人机验证时不显示秒数：那段时长取决于用户何时动手，报出来只会误导 ——
+		// 说成「网络较慢」是冤枉用户的网，报成「N 秒」又像在催人。
+		if (state.stage === 'verify') {
+			el.className = 'connect-status';
+			el.textContent = t(key, fallback);
+			continue;
+		}
 		const slow = state.slow ? ` · ${t('ui.connect_slow', 'Slow network, still trying')}` : '';
 		el.className = 'connect-status' + (state.slow ? ' connect-status-slow' : '');
 		el.textContent = `${t(key, fallback)} · ${state.seconds}s${slow}`;

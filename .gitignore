@@ -50,3 +50,12 @@ client/build/
 coverage/
 dist/
 新增功能.md
+
+# ── 密钥与凭据（绝不入库）────────────────────────────────────────
+# 注意 `.env` / `.env.*` 挡不住 `turnstile.env`、`admin.env` 这类命名，
+# 必须再加一条 `*.env` 才能覆盖。模板文件用 ! 例外保留。
+*.env
+!*.env.example
+*.pem
+*.key
+keystore.properties

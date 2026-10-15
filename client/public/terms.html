@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<meta name="robots" content="index,follow">
+	<title>服务条款 - NodeCrypt</title>
+	<meta name="description" content="NodeCrypt 加密聊天服务的服务条款、可接受使用规则、数据处理说明与举报方式。">
+	<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+	<style>
+		:root {
+			--accent: #30a8f7;
+			--text: #333;
+			--text-strong: #2D3748;
+			--muted: #666;
+			--line: #e3e6ea;
+			--bg-soft: #fafbfc;
+		}
+		* { box-sizing: border-box; }
+		body {
+			margin: 0;
+			padding: 0 16px 64px;
+			background: #fff;
+			color: var(--text);
+			font-family: 'Roboto', Arial, 'Microsoft YaHei', sans-serif;
+			font-size: 15px;
+			line-height: 1.75;
+			-webkit-text-size-adjust: 100%;
+		}
+		.wrap { max-width: 760px; margin: 0 auto; }
+		header {
+			padding: 32px 0 20px;
+			border-bottom: 1px solid var(--line);
+			margin-bottom: 28px;
+		}
+		h1 { font-size: 24px; margin: 0 0 8px; color: var(--text-strong); font-weight: 600; }
+		.sub { color: var(--muted); font-size: 14px; margin: 0; }
+		h2 {
+			font-size: 17px;
+			margin: 34px 0 10px;
+			color: var(--text-strong);
+			font-weight: 600;
+			padding-left: 11px;
+			border-left: 3px solid var(--accent);
+		}
+		h3 { font-size: 15px; margin: 20px 0 6px; color: var(--text-strong); font-weight: 600; }
+		p { margin: 10px 0; }
+		ul, ol { margin: 10px 0; padding-left: 22px; }
+		li { margin: 6px 0; }
+		a { color: var(--accent); text-decoration: none; }
+		a:hover { text-decoration: underline; }
+		strong { color: var(--text-strong); }
+		.callout {
+			background: var(--bg-soft);
+			border: 1px solid var(--line);
+			border-left: 3px solid var(--accent);
+			border-radius: 4px;
+			padding: 14px 16px;
+			margin: 18px 0;
+		}
+		.callout p:first-child { margin-top: 0; }
+		.callout p:last-child { margin-bottom: 0; }
+		table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14px; }
+		th, td { border: 1px solid var(--line); padding: 9px 11px; text-align: left; vertical-align: top; }
+		th { background: var(--bg-soft); font-weight: 600; white-space: nowrap; }
+		code {
+			background: var(--bg-soft);
+			border: 1px solid var(--line);
+			border-radius: 3px;
+			padding: 1px 5px;
+			font-size: 13px;
+			font-family: Consolas, Monaco, monospace;
+		}
+		footer {
+			margin-top: 44px;
+			padding-top: 20px;
+			border-top: 1px solid var(--line);
+			color: var(--muted);
+			font-size: 13px;
+		}
+		.back {
+			display: inline-block;
+			margin-top: 6px;
+			padding: 9px 18px;
+			border: 1px solid var(--accent);
+			border-radius: 4px;
+			color: var(--accent);
+		}
+		.back:hover { background: var(--accent); color: #fff; text-decoration: none; }
+	</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+	<h1>服务条款</h1>
+	<p class="sub">适用于本站在 <code>chat.cxywh.cn</code> 提供的加密聊天服务 · 最近更新：2026 年 10 月 15 日</p>
+</header>
+
+<div class="callout">
+	<p><strong>一句话说明白</strong>：这是一个免费的、端到端加密的临时聊天服务。加密与解密全部在你的浏览器里完成，服务器只转发密文，<strong>服务端读不到你说了什么，也读不到你传了什么文件</strong>。所以下面有些规则只能靠你自觉 —— 因为我们确实看不见。</p>
+</div>
+
+<h2>一、这个服务是什么</h2>
+<p>本站是一个基于开源项目 NodeCrypt 搭建的端到端加密聊天服务，供访问者创建或加入加密房间进行文字聊天和文件传输。服务免费提供，无账号体系、无注册流程。</p>
+<p>进入一个房间只需要<strong>房间名 + 密码</strong>两组信息。这两组信息同时充当房间地址和加密口令，本站不保存它们，也不提供任何找回方式。</p>
+
+<h2>二、端到端加密带来的实际后果</h2>
+<p>这一节不是免责话术，而是你使用前必须知道的物理事实：</p>
+<ul>
+	<li><strong>服务器读不到聊天内容</strong>。消息在你的浏览器里加密后才发出，服务器只做转发。这意味着管理员<strong>没有能力</strong>查看、检索或导出任何聊天记录。</li>
+	<li><strong>没有历史记录</strong>。消息不落库，所有参与者都离开房间后内容即消失。换设备、关页面、刷新，之前的消息都不会回来。</li>
+	<li><strong>密码丢了就是丢了</strong>。没有邮箱、没有手机号、没有客服可以重置。忘记密码等于这个房间对你永久关闭 —— 换个房间名重新开一个即可。</li>
+	<li><strong>房间里的人都在同一个加密域里</strong>。能进同一个房间的人就能解密该房间的消息。请只把房间名和密码告诉你信任的人。</li>
+	<li><strong>我们无法替你删除别人手里的内容</strong>。对端可以截图、录屏。加密保护的是传输和服务器，不是对方的屏幕。</li>
+</ul>
+
+<h2>三、可接受使用</h2>
+<p>使用本服务即表示你同意<strong>不</strong>将本服务用于下列用途：</p>
+<ul>
+	<li>发布、传播违反中华人民共和国法律法规的内容，包括但不限于危害国家安全、暴力恐怖、淫秽色情、赌博、毒品相关内容</li>
+	<li>涉及未成年人的色情或性暗示内容</li>
+	<li>骚扰、威胁、人肉搜索、跟踪、诽谤他人，或未经同意散布他人隐私信息</li>
+	<li>诈骗、传销、非法集资、冒充他人身份骗取财物</li>
+	<li>传播恶意软件、病毒、木马，或利用本服务投递钓鱼链接</li>
+	<li>未经授权传播受版权保护的影视、音乐、软件等作品</li>
+	<li>利用本服务进行自动化刷量、压测、爬取或任何意图耗尽服务资源的行为</li>
+	<li>尝试攻击、探测、绕过本站的安全机制（包括人机验证与频率限制），或干扰其他用户正常使用</li>
+</ul>
+
+<h2>四、我们的处置方式</h2>
+<p>由于服务端读不到内容，我们能采取的措施是有限的，且大多针对<strong>连接层面</strong>而非内容层面：</p>
+<table>
+	<thead>
+		<tr><th>措施</th><th>触发条件</th><th>说明</th></tr>
+	</thead>
+	<tbody>
+		<tr>
+			<td>频率限制</td>
+			<td>同一出口 IP 在 60 秒内发起超过 60 次连接</td>
+			<td>自动生效，无需人工。表现为短时间内无法继续连接，等待一分钟后恢复。</td>
+		</tr>
+		<tr>
+			<td>人机验证</td>
+			<td>每次建立连接时</td>
+			<td>用于阻挡自动化脚本刷取资源，正常用户通常无感知。</td>
+		</tr>
+		<tr>
+			<td>封禁出口 IP</td>
+			<td>收到举报并核实后</td>
+			<td>按 IP 封禁。副作用是同一网络下的其他人可能一起受影响。</td>
+		</tr>
+		<tr>
+			<td>关闭服务</td>
+			<td>出现无法处置的滥用时</td>
+			<td>本站是免费个人项目，没有全天候运营团队。极端情况下可能直接停止服务。</td>
+		</tr>
+	</tbody>
+</table>
+<p>处置<strong>不预先通知</strong>。对免费服务来说，通知机制本身就是额外的攻击面。</p>
+
+<h2>五、数据处理说明</h2>
+<p>我们尽量少碰你的数据。以下是服务端<strong>实际</strong>会接触到的全部内容：</p>
+<ul>
+	<li><strong>不保存</strong>：聊天消息、文件内容、房间密码、用户名。这些要么在客户端加密后才到达服务器（消息、文件），要么根本不上传（密码、用户名）。</li>
+	<li><strong>连接元数据</strong>：为了防滥用与频率限制，服务端会短暂处理你的出口 IP 和连接时间。IP 的建连计数保存约一分钟，用于滑动窗口限流。</li>
+	<li><strong>举报内容</strong>：如果你提交举报，举报人填写的内容、来源 IP 和提交时间会被保存，供管理员查阅处理。举报记录不会公开。</li>
+	<li><strong>基础设施日志</strong>：服务运行在 Cloudflare 的免费计划上，Cloudflare 会按其自身政策处理网络层日志，这部分不在本站控制范围内。</li>
+</ul>
+
+<h2>六、举报滥用</h2>
+<p>如果你在本站遇到违法内容或骚扰行为，请通过<strong>举报页</strong>提交：</p>
+<p><a class="back" href="/report">前往举报页</a></p>
+<p>请注意，由于服务端无法读取聊天内容，<strong>举报时请尽量提供</strong>：房间名（或房间链接）、对方的显示昵称、事发时间、以及最重要的 —— <strong>截图</strong>。没有截图，我们能做的通常只有按 IP 封禁这一层。</p>
+
+<h2>七、免责声明与责任限制</h2>
+<ul>
+	<li>本服务按<strong>「现状」</strong>提供，不附带任何明示或默示的担保，包括但不限于可用性、连续性、适合特定用途、无中断或无错误。</li>
+	<li>服务运行在免费额度之上，<strong>可能因为额度耗尽或上游策略变化而随时中断、限速或停止</strong>，恕不另行通知。</li>
+	<li>本站不对用户在服务中发布的内容负责，也不对因使用本服务产生的任何直接或间接损失负责。</li>
+	<li>加密强度依赖你的浏览器实现与你设置的密码强度。请使用足够长的密码。</li>
+</ul>
+
+<h2>八、条款变更</h2>
+<p>本条款可能随时修订，修订后即刻生效。继续使用本服务即视为接受修订后的条款。重大变更会在本页更新「最近更新」日期。</p>
+
+<footer>
+	<p>本服务基于开源项目 <a href="https://github.com/shuaiplus/NodeCrypt" target="_blank" rel="noopener">NodeCrypt</a> 搭建，源码遵循原项目许可协议。</p>
+	<p><a class="back" href="/">返回聊天</a></p>
+</footer>
+
+</div>
+</body>
+</html>
