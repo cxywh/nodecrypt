@@ -223,50 +223,50 @@ function volumeToBytes(volume) {
 	return base64ToArrayBuffer(String(volume));
 }
 
+// 拼装分卷并解压，返回明文字节。不保存，也不吞异常。
+// 下载与图片预览共用这一条路径，两者得到的字节因此完全一致。
+async function assembleFileBytes(volumes, originalHash = null) {
+	// Combine all volumes（形态归一化后再拼装）
+	const combinedData = volumes.map(volumeToBytes);
+
+	const totalLength = combinedData.reduce((sum, arr) => sum + arr.length, 0);
+	const compressed = new Uint8Array(totalLength);
+	let offset = 0;
+
+	for (const data of combinedData) {
+		compressed.set(data, offset);
+		offset += data.length;
+	}
+
+	const decompressed = await new Promise((resolve, reject) => {
+		inflate(compressed, (err, out) => (err ? reject(err) : resolve(out)));
+	});
+
+	// Verify hash if provided
+	if (originalHash) {
+		let calculatedHash;
+		try {
+			calculatedHash = await calculateHash(decompressed);
+		} catch (hashError) {
+			throw new Error('File integrity check failed: ' + hashError.message);
+		}
+		if (calculatedHash !== originalHash) {
+			throw new Error('File integrity check failed: hash mismatch');
+		}
+	}
+
+	return decompressed;
+}
+
 // Decompress volumes back to file
 // 将分卷解压回文件
 async function decompressVolumesToFile(volumes, fileName, originalHash = null) {
 	try {
-		// Combine all volumes（形态归一化后再拼装）
-		const combinedData = volumes.map(volumeToBytes);
-		
-		const totalLength = combinedData.reduce((sum, arr) => sum + arr.length, 0);
-		const compressed = new Uint8Array(totalLength);
-		let offset = 0;
-		
-		for (const data of combinedData) {
-			compressed.set(data, offset);
-			offset += data.length;
-		}
-				// Decompress
-		return new Promise((resolve, reject) => {
-			inflate(compressed, async (err, decompressed) => {
-				if (err) {
-					reject(err);
-					return;
-				}
-				
-				// Verify hash if provided
-				if (originalHash) {
-					try {
-						const calculatedHash = await calculateHash(decompressed);
-						if (calculatedHash !== originalHash) {
-							reject(new Error('File integrity check failed: hash mismatch'));
-							return;
-						}
-					} catch (hashError) {
-						reject(new Error('File integrity check failed: ' + hashError.message));
-						return;
-					}
-				}
-				
-				// 走统一的保存入口：浏览器里是 <a download>，安卓壳里转原生桥。
-				// 这里原来是内联的 blob + <a download>，在 WebView 里会静默失效。
-				saveBlob(new Blob([decompressed]), fileName);
-				
-				resolve();
-			});
-		});
+		const decompressed = await assembleFileBytes(volumes, originalHash);
+
+		// 走统一的保存入口：浏览器里是 <a download>，安卓壳里转原生桥。
+		// 这里原来是内联的 blob + <a download>，在 WebView 里会静默失效。
+		saveBlob(new Blob([decompressed]), fileName);
 	} catch (error) {
 		console.error('Decompression error:', error);
 		throw error;
@@ -432,7 +432,8 @@ async function handleFilesUpload(files, onSend, onSendBinary) {
 				totalVolumes: volumes.length,
 				sentVolumes: 0,
 				status: 'sending',
-				originalHash
+				originalHash,
+				localFile: file // 仅用于本机预览，不参与传输
 			};
 			
 			window.fileTransfers.set(fileId, fileTransfer);
@@ -634,11 +635,68 @@ async function sendVolumes(fileId, volumes, onSend, onSendBinary, updateProgress
 	sendNextBatch();
 }
 
+// 图片附件预览。
+// 用扩展名判定而非 MIME：直传通道的 file_start 消息里没有 MIME 字段。
+// 设上限是为了避免为预览付出过大的解码与内存代价，超过上限的图片仍可下载后查看。
+const IMAGE_PREVIEW_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif'];
+const IMAGE_PREVIEW_MAX_BYTES = 4 * 1024 * 1024;
+
+function isPreviewableImage(fileName, size) {
+	const ext = String(fileName || '').split('.').pop().toLowerCase();
+	if (!IMAGE_PREVIEW_EXTENSIONS.includes(ext)) return false;
+	return typeof size !== 'number' || size <= IMAGE_PREVIEW_MAX_BYTES;
+}
+
+// 把预览图挂进文件卡。卡片是块级容器，追加的图片独占一行，不干扰原有布局。
+function mountImagePreview(fileId, url) {
+	const card = document.querySelector(`.file-message[data-file-id="${fileId}"]`);
+	if (!card || card.querySelector('.file-image-preview')) return false;
+	const img = document.createElement('img');
+	img.className = 'file-image-preview';
+	img.alt = '';
+	img.src = url;
+	card.appendChild(img);
+	return true;
+}
+
+// 按传输状态决定是否以及何时生成预览。
+// 发送方本地就有原始文件，直接取用；接收方要等分卷全部到达，因此只在传输完成时拼装解密。
+// R2 通道的密文不在本地，不做预览。预览失败只记控制台，不打扰用户，下载按钮始终可用。
+function maybeRenderImagePreview(fileId, transfer) {
+	if (!transfer || transfer.previewDone) return;
+	if (transfer.isArchive) return;
+	if (!isPreviewableImage(transfer.fileName, transfer.originalSize)) return;
+
+	if (transfer.localFile) {
+		const url = URL.createObjectURL(transfer.localFile);
+		if (mountImagePreview(fileId, url)) transfer.previewDone = true;
+		else URL.revokeObjectURL(url);
+		return;
+	}
+
+	if (transfer.isR2 || transfer.status !== 'completed') return;
+	if (!Array.isArray(transfer.volumeData)) return;
+
+	transfer.previewDone = true;
+	assembleFileBytes(transfer.volumeData, transfer.originalHash)
+		.then((bytes) => {
+			// 卡片可能尚未渲染，此时允许后续进度回调再试一次。
+			if (!mountImagePreview(fileId, URL.createObjectURL(new Blob([bytes])))) {
+				transfer.previewDone = false;
+			}
+		})
+		.catch((error) => {
+			transfer.previewDone = false;
+			console.warn('[NodeCrypt] image preview failed:', error && error.message);
+		});
+}
+
 // Update file progress in chat
 // 更新聊天中的文件进度
 function updateFileProgress(fileId) {
 	const transfer = window.fileTransfers.get(fileId);
 	if (!transfer) return;
+	maybeRenderImagePreview(fileId, transfer);
 	const elements = document.querySelectorAll(`[data-file-id="${fileId}"]`);
 	elements.forEach(element => {
 		const progressContainer = element.querySelector('.file-progress-container');
