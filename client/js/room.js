@@ -19,7 +19,9 @@ import {
 	STAGE
 } from './util.connect.js';
 import {
-	escapeHTML
+	escapeHTML,
+	computeDisplayNames,
+	resolveDisplayName,
 } from './util.string.js';
 import {
 	$id,
@@ -208,6 +210,17 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 	roomsData[idx].chat = chatInst
 }
 
+// 重算房间级显示名。成员名单或成员信息变化后调用，这是唯一的刷新入口。
+// 重名在这里被消歧，其余所有取名字的地方都走 resolveDisplayName。
+// 服务端下发的成员名单逐人剔除接收者自己（worker 的 broadcastMemberList），
+// 因此这里补上自身条目，否则「我」与同名成员之间不会消歧。
+function refreshDisplayNames(rd) {
+	if (!rd) return;
+	const entries = (rd.userList || []).slice();
+	if (rd.myId && rd.myUserName) entries.push({ clientId: rd.myId, userName: rd.myUserName });
+	rd.displayNames = computeDisplayNames(entries, t('ui.anonymous', 'Anonymous'));
+}
+
 // Handle the client list update
 // 处理客户端列表更新
 export function handleClientList(idx, list, selfId) {
@@ -222,6 +235,7 @@ export function handleClientList(idx, list, selfId) {
 	}
 	rd.userList = list;
 	rd.userMap = {};
+	refreshDisplayNames(rd);
 	list.forEach(u => {
 		rd.userMap[u.clientId] = u
 	});
@@ -249,6 +263,7 @@ export function handleClientSecured(idx, user) {
 	} else {
 		rd.userList[existingUserIndex] = user
 	}
+	refreshDisplayNames(rd);
 	if (activeRoomIndex === idx) {
 		renderUserList(false);
 		renderMainHeader()
@@ -258,7 +273,8 @@ export function handleClientSecured(idx, user) {
 	}
 	const isNew = !rd.knownUserIds.has(user.clientId);
 	if (isNew) {
-		rd.knownUserIds.add(user.clientId);		const name = user.userName || user.username || user.name || t('ui.anonymous', 'Anonymous');
+		rd.knownUserIds.add(user.clientId);
+		const name = resolveDisplayName(rd, user.clientId, t('ui.anonymous', 'Anonymous'));
 		const msg = `${name} ${t('system.joined', 'joined the conversation')}`;
 		rd.messages.push({
 			type: 'system',
@@ -283,8 +299,7 @@ export function handleClientLeft(idx, clientId) {
 			updateChatInputStyle()
 		}
 	}
-	const user = rd.userMap[clientId];
-	const name = user ? (user.userName || user.username || user.name || 'Anonymous') : 'Anonymous';
+	const name = resolveDisplayName(rd, clientId, t('ui.anonymous', 'Anonymous'));
 	const msg = `${name} ${t('system.left', 'left the conversation')}`;
 	rd.messages.push({
 		type: 'system',
@@ -293,6 +308,7 @@ export function handleClientLeft(idx, clientId) {
 	if (activeRoomIndex === idx) addSystemMsg(msg, true);
 	rd.userList = rd.userList.filter(u => u.clientId !== clientId);
 	delete rd.userMap[clientId];
+	refreshDisplayNames(rd);
 	if (activeRoomIndex === idx) {
 		renderUserList(false);
 		renderMainHeader()
@@ -321,7 +337,7 @@ export function handleClientMessage(idx, msg) {
 			|| msgType === 'file_offer' || msgType === 'file_offer_private') {
 			let realUserName = msg.userName;
 			if (!realUserName && msg.clientId && newRd.userMap[msg.clientId]) {
-				realUserName = newRd.userMap[msg.clientId].userName || newRd.userMap[msg.clientId].username || newRd.userMap[msg.clientId].name;
+				realUserName = resolveDisplayName(newRd, msg.clientId, t('ui.anonymous', 'Anonymous'));
 			}
 			const historyMsgType = (msgType === 'file_start_private' || msgType === 'file_offer_private') ? 'file_private' : 'file';
 			
@@ -380,7 +396,7 @@ export function handleClientMessage(idx, msg) {
 	}
 	let realUserName = msg.userName;
 	if (!realUserName && msg.clientId && newRd.userMap[msg.clientId]) {
-		realUserName = newRd.userMap[msg.clientId].userName || newRd.userMap[msg.clientId].username || newRd.userMap[msg.clientId].name;
+		realUserName = resolveDisplayName(newRd, msg.clientId, t('ui.anonymous', 'Anonymous'));
 	}
 
 	// Add message to messages array for chat history

@@ -1900,12 +1900,16 @@ h2{
 	word-break: break-word;
 }
 
-/* 文件卡内的图片预览。卡片本身是块级容器且宽度受限，追加的图片独占一行。 */
-.file-image-preview {
+/* 文件卡内的媒体预览。卡片本身是块级容器且宽度受限，追加的媒体独占一行。 */
+.file-media-preview {
 	display: block;
 	width: 100%;
-	max-height: 240px;
 	margin-top: 6px;
 	border-radius: 8px;
+}
+
+img.file-media-preview,
+video.file-media-preview {
+	max-height: 240px;
 	object-fit: contain;
 }

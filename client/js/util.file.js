@@ -635,41 +635,58 @@ async function sendVolumes(fileId, volumes, onSend, onSendBinary, updateProgress
 	sendNextBatch();
 }
 
-// 图片附件预览。
+// 文件卡内联预览支持的媒体类型。
 // 用扩展名判定而非 MIME：直传通道的 file_start 消息里没有 MIME 字段。
-// 设上限是为了避免为预览付出过大的解码与内存代价，超过上限的图片仍可下载后查看。
-const IMAGE_PREVIEW_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif'];
-const IMAGE_PREVIEW_MAX_BYTES = 4 * 1024 * 1024;
+// 上限按类型区分 —— 图片解码成本低，音视频要占住解码器与播放缓冲，因此限得更紧。
+// 新增一种类型只需要增加一个数组元素。
+const MEDIA_PREVIEW_KINDS = [
+	{ tag: 'img', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif'], maxBytes: 4 * 1024 * 1024 },
+	{ tag: 'video', extensions: ['mp4', 'webm', 'ogv'], maxBytes: 8 * 1024 * 1024 },
+	{ tag: 'audio', extensions: ['mp3', 'wav', 'ogg', 'oga', 'm4a', 'aac', 'flac', 'opus'], maxBytes: 8 * 1024 * 1024 }
+];
 
-function isPreviewableImage(fileName, size) {
+// 命中返回对应的类型描述，否则返回 null（含超出该类型上限的情况）。
+function pickPreviewKind(fileName, size) {
 	const ext = String(fileName || '').split('.').pop().toLowerCase();
-	if (!IMAGE_PREVIEW_EXTENSIONS.includes(ext)) return false;
-	return typeof size !== 'number' || size <= IMAGE_PREVIEW_MAX_BYTES;
+	for (const kind of MEDIA_PREVIEW_KINDS) {
+		if (!kind.extensions.includes(ext)) continue;
+		if (typeof size === 'number' && size > kind.maxBytes) return null;
+		return kind;
+	}
+	return null;
 }
 
-// 把预览图挂进文件卡。卡片是块级容器，追加的图片独占一行，不干扰原有布局。
-function mountImagePreview(fileId, url) {
+// 把预览元素挂进文件卡。卡片是块级容器，追加的媒体独占一行，不干扰原有布局。
+function mountMediaPreview(fileId, url, kind) {
 	const card = document.querySelector(`.file-message[data-file-id="${fileId}"]`);
-	if (!card || card.querySelector('.file-image-preview')) return false;
-	const img = document.createElement('img');
-	img.className = 'file-image-preview';
-	img.alt = '';
-	img.src = url;
-	card.appendChild(img);
+	if (!card || card.querySelector('.file-media-preview')) return false;
+	const el = document.createElement(kind.tag);
+	el.className = 'file-media-preview';
+	el.src = url;
+	if (kind.tag === 'img') {
+		el.alt = '';
+	} else {
+		el.controls = true;
+		el.preload = 'metadata';
+		// iOS 默认全屏接管视频播放，加这个属性才是页内播放。
+		if (kind.tag === 'video') el.playsInline = true;
+	}
+	card.appendChild(el);
 	return true;
 }
 
 // 按传输状态决定是否以及何时生成预览。
 // 发送方本地就有原始文件，直接取用；接收方要等分卷全部到达，因此只在传输完成时拼装解密。
 // R2 通道的密文不在本地，不做预览。预览失败只记控制台，不打扰用户，下载按钮始终可用。
-function maybeRenderImagePreview(fileId, transfer) {
+function maybeRenderMediaPreview(fileId, transfer) {
 	if (!transfer || transfer.previewDone) return;
 	if (transfer.isArchive) return;
-	if (!isPreviewableImage(transfer.fileName, transfer.originalSize)) return;
+	const kind = pickPreviewKind(transfer.fileName, transfer.originalSize);
+	if (!kind) return;
 
 	if (transfer.localFile) {
 		const url = URL.createObjectURL(transfer.localFile);
-		if (mountImagePreview(fileId, url)) transfer.previewDone = true;
+		if (mountMediaPreview(fileId, url, kind)) transfer.previewDone = true;
 		else URL.revokeObjectURL(url);
 		return;
 	}
@@ -681,13 +698,13 @@ function maybeRenderImagePreview(fileId, transfer) {
 	assembleFileBytes(transfer.volumeData, transfer.originalHash)
 		.then((bytes) => {
 			// 卡片可能尚未渲染，此时允许后续进度回调再试一次。
-			if (!mountImagePreview(fileId, URL.createObjectURL(new Blob([bytes])))) {
+			if (!mountMediaPreview(fileId, URL.createObjectURL(new Blob([bytes])), kind)) {
 				transfer.previewDone = false;
 			}
 		})
 		.catch((error) => {
 			transfer.previewDone = false;
-			console.warn('[NodeCrypt] image preview failed:', error && error.message);
+			console.warn('[NodeCrypt] media preview failed:', error && error.message);
 		});
 }
 
@@ -696,7 +713,7 @@ function maybeRenderImagePreview(fileId, transfer) {
 function updateFileProgress(fileId) {
 	const transfer = window.fileTransfers.get(fileId);
 	if (!transfer) return;
-	maybeRenderImagePreview(fileId, transfer);
+	maybeRenderMediaPreview(fileId, transfer);
 	const elements = document.querySelectorAll(`[data-file-id="${fileId}"]`);
 	elements.forEach(element => {
 		const progressContainer = element.querySelector('.file-progress-container');

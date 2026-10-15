@@ -11,7 +11,8 @@ import {
 	exitRoom
 } from './room.js';
 import {
-	escapeHTML
+	escapeHTML,
+	resolveDisplayName
 } from './util.string.js';
 import {
 	$id
@@ -310,12 +311,13 @@ export function createUserItem(user, isMe) {
 	const rd = roomsData[activeRoomIndex];
 	const isPrivateTarget = rd && user.clientId === rd.privateChatTargetId;
 	div.className = 'member' + (isMe ? ' me' : '') + (isPrivateTarget ? ' private-chat-active' : '');
-	const rawName = user.userName || user.username || user.name || '';
-	const safeUserName = escapeHTML(rawName);
+	// 显示名走统一出口：重名时带序号。头像也按显示名生成，两个同名的人才有不同的头像。
+	const displayName = resolveDisplayName(rd, user.clientId, '');
+	const safeUserName = escapeHTML(displayName);
 	div.innerHTML = `<span class="avatar"></span><div class="member-info"><div class="member-name">${safeUserName}${isMe?t('ui.me', ' (me)'):''}</div></div>`;
 	const avatarEl = div.querySelector('.avatar');
 	if (avatarEl) {
-		const svg = createAvatarSVG(rawName);
+		const svg = createAvatarSVG(displayName);
 		const cleanSvg = svg.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
 		avatarEl.innerHTML = cleanSvg
 	}
@@ -389,18 +391,63 @@ export function setupMoreBtnMenu() {
 
 // Prevent space and special character input
 // 禁止输入空格和特殊字符
+// 过滤用户名、房间名、密码中的空白与标点。
+// 与 preventSpaceInput 共用同一套规则，保证「按键时挡住」与「提交前兜底」结果一致。
+export function sanitizeLoginValue(value) {
+	return String(value == null ? '' : value).replace(/[\s\p{P}\p{S}]/gu, function(match) {
+		return match === "'" ? "'" : ''
+	});
+}
+
+// 提交前对若干字段做一次过滤。输入法、密码管理器与浏览器自动填充都可能不触发 input
+// 事件，因此不能只依赖按键拦截。
+function sanitizeLoginInputs(ids) {
+	ids.forEach(function(id) {
+		const el = document.getElementById(id);
+		if (el) el.value = sanitizeLoginValue(el.value);
+	});
+}
+
+// 阻止在用户名、房间名、密码里输入空格与标点。
+//
+// 必须区分「输入法组合期」：拼音等输入法用空格键选字，且在组合过程中会持续触发
+// keydown 与 input。此前无条件对空格 preventDefault，并在 input 里重写 input.value，
+// 会把正在组合的缓冲区打断 —— 表现为 iOS 上连续输入拼音出现英文连词（上游 issue #25）。
+// 组合状态用 e.isComposing 判定，并兼容 keyCode 229（部分实现只给这个）。
 export function preventSpaceInput(input) {
 	if (!input) return;
+
+	const isComposing = function(e) {
+		return e.isComposing === true || e.keyCode === 229;
+	};
+
+	const sanitize = function() {
+		const filtered = sanitizeLoginValue(input.value);
+		if (filtered === input.value) return;
+		const caret = input.selectionStart;
+		input.value = filtered;
+		// 过滤会改变长度，尽量把光标放回原处，避免输入被打断后跳到行首。
+		if (typeof caret === 'number') {
+			try {
+				input.setSelectionRange(Math.min(caret, filtered.length), Math.min(caret, filtered.length));
+			} catch (error) {
+				// 部分 input 类型不支持选区，忽略即可。
+			}
+		}
+	};
+
 	input.addEventListener('keydown', function(e) {
+		if (isComposing(e)) return;
 		if (e.key === ' ' || (/[\u0000-\u007f]/.test(e.key) && /[\p{P}\p{S}]/u.test(e.key) && e.key !== "'")) {
 			e.preventDefault()
 		}
 	});
 	input.addEventListener('input', function(e) {
-		input.value = input.value.replace(/[\s\p{P}\p{S}]/gu, function(match) {
-			return match === "'" ? "'" : ''
-		})
-	})
+		// 组合期间的 value 是半成品，动它会破坏输入法状态。
+		if (isComposing(e)) return;
+		sanitize();
+	});
+	input.addEventListener('compositionend', sanitize);
 }
 
 // Login form submit handler
@@ -410,12 +457,14 @@ export function loginFormHandler(modal) {
 		e.preventDefault();
 		let userName, roomName, password, btn, roomInput, warnTip;
 		if (modal) {
+			sanitizeLoginInputs(['userName-modal', 'roomName-modal', 'password-modal']);
 			userName = document.getElementById('userName-modal').value.trim();
 			roomName = document.getElementById('roomName-modal').value.trim();
 			password = document.getElementById('password-modal').value.trim();
 			btn = modal.querySelector('.login-btn');
 			roomInput = document.getElementById('roomName-modal')
 		} else {
+			sanitizeLoginInputs(['userName', 'roomName', 'password']);
 			userName = document.getElementById('userName').value.trim();
 			roomName = document.getElementById('roomName').value.trim();
 			password = document.getElementById('password').value.trim();

@@ -424,7 +424,7 @@ class NodeCrypt {
 					}
 				}
 				try {
-					this.callbacks.onClientList(clients)
+					this.callbacks.onClientList(clients, serverDecrypted.c)
 				} catch (error) {
 					this.logEvent('onMessage-client-list-callback', error, 'error')
 				}

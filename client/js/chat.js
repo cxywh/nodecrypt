@@ -9,7 +9,8 @@ import {
 } from './room.js';
 import {
 	escapeHTML,
-	textToHTML
+	textToHTML,
+	resolveDisplayName
 } from './util.string.js';
 import {
 	$,
@@ -126,7 +127,7 @@ export function addOtherMsg(msg, userName = '', avatar = '', isHistory = false, 
 		if (msg && msg.userName) {
 			userName = msg.userName;
 		} else if (rd && msg && msg.clientId && rd.userMap[msg.clientId]) {
-			userName = rd.userMap[msg.clientId].userName || rd.userMap[msg.clientId].username || rd.userMap[msg.clientId].name || t('ui.anonymous', 'Anonymous')
+			userName = resolveDisplayName(rd, msg.clientId, t('ui.anonymous', 'Anonymous'))
 		}
 	}
 	userName = userName || t('ui.anonymous', 'Anonymous');

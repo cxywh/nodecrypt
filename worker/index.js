@@ -1318,6 +1318,9 @@ export class ChatRoom {
 
           const messageObj = {
             a: 'l',
+            // 成员名单逐人剔除接收者本人，c 用来告知接收者自己的 clientId。
+            // 客户端据此在成员列表里标出自己，并在重名消歧时把自己计入比较。
+            c: member,
             p: members.filter((value) => {
               return (value !== member ? true : false);
             })
