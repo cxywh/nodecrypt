@@ -584,55 +584,60 @@ async function uploadFilesViaR2(files, onSend) {
 // 分卷是裸字节，先 base64 再塞进 JSON 会叠三层编码 —— 实测链路膨胀 137%。
 // 二进制帧只有 17 字节帧头 + 12 字节 IV + 16 字节标签，同一份实测 0.017%。
 // file_start / file_complete 这些元数据仍然走 JSON，它们只有几百字节。
+// 分卷发送：滑动窗口并发，不再按批加固定延迟。
+//
+// 吞吐的实际上限是「在途分卷数 × 分卷大小 / 往返时延」，不是链路带宽也不是加密速度。
+// 固定 100ms 批间延迟只是早年用来代替流控的粗糙手段：它把速率钉死在
+// (batchSize × VOLUME_SIZE) / 100ms，与链路状况无关，链路越好浪费越大。
+// 这里改为按在途数量限流 —— 每完成一卷补一卷，缓冲增长有上界，
+// 速率由链路的实际往返时延决定。
 async function sendVolumes(fileId, volumes, onSend, onSendBinary, updateProgress, fileName) {
 	const fileTransfer = window.fileTransfers.get(fileId);
 	if (!fileTransfer) return;
-	
-	let currentVolume = 0;
-	const batchSize = 5; // 每批发送5个分卷
-	
-	function sendNextBatch() {
-		if (currentVolume >= volumes.length) {
-			// 发送完成消息
-			onSend({
-				type: 'file_complete',
-				fileId
-			});
-			
-			fileTransfer.status = 'completed';
-			updateFileProgress(fileId);
-			updateProgress(`✓ Sent ${fileName} successfully`);
-			return;
-		}
-		
-		// 发送当前批次
-		const batchEnd = Math.min(currentVolume + batchSize, volumes.length);
-		
-		for (let i = currentVolume; i < batchEnd; i++) {
+
+	// 在途分卷上限。每卷 256 KiB，24 卷约 6 MiB 缓冲，对端与中继都能跟上；
+	// 继续调高收益递减，反而抬高服务端的单对象消息排队。
+	const MAX_IN_FLIGHT = 24;
+	let nextIndex = 0;
+	let inFlight = 0;
+	let finished = false;
+
+	const finish = () => {
+		if (finished) return;
+		finished = true;
+		onSend({ type: 'file_complete', fileId });
+		fileTransfer.status = 'completed';
+		updateFileProgress(fileId);
+		updateProgress(`✓ Sent ${fileName} successfully`);
+	};
+
+	// 启动条件：有剩余分卷且未达窗口上限。窗口空且无剩余时收尾。
+	const pump = () => {
+		while (inFlight < MAX_IN_FLIGHT && nextIndex < volumes.length) {
+			const index = nextIndex++;
+			inFlight++;
+
 			// 元数据（fileId / 卷号 / 总卷数）跟着载荷一起进同一次 AEAD，
 			// 所以接收方不需要额外校验卷号来源 —— 改了就解不开。
-			const record = packVolumeRecord(fileId, i, volumes.length, volumes[i]);
-			// onSendBinary 是 async（每个对端各加密一次）。这里不 await：
-			// 保持原来「一批发完立刻排下一批」的 100ms 节奏。加密本身很快，
-			// 真要背压时再说 —— 但错误必须接住，否则会变成 unhandled rejection。
-			Promise.resolve(onSendBinary(record)).catch((error) => {
-				console.error('file volume send failed:', error);
-				window.addSystemMsg?.(`分卷发送失败：${fileName} — ${error.message}`);
-			});
+			// onSendBinary 是 async（每个对端各加密一次），这里并发发起、
+			// 由完成回调补位；错误必须接住，否则会变成 unhandled rejection。
+			Promise.resolve(onSendBinary(packVolumeRecord(fileId, index, volumes.length, volumes[index])))
+				.catch((error) => {
+					console.error('file volume send failed:', error);
+					window.addSystemMsg?.(`分卷发送失败：${fileName} — ${error.message}`);
+				})
+				.then(() => {
+					inFlight--;
+					fileTransfer.sentVolumes = nextIndex - inFlight;
+					updateFileProgress(fileId);
+					pump();
+				});
 		}
-		
-		// 更新发送进度
-		fileTransfer.sentVolumes = batchEnd;
-		updateFileProgress(fileId);
-		
-		currentVolume = batchEnd;
-		
-		// 继续发送下一批，使用较短的延迟
-		setTimeout(sendNextBatch, 100);
-	}
-	
-	// 开始发送
-	sendNextBatch();
+
+		if (inFlight === 0 && nextIndex >= volumes.length) finish();
+	};
+
+	pump();
 }
 
 // 文件卡内联预览支持的媒体类型。

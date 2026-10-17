@@ -274,8 +274,21 @@ await me.to(targetId, 'file_start', {
 console.log(`  [1] file_start 已发`);
 
 // 2) 分卷
-for (let i = 0; i < volumes.length; i++) {
-	await me.volume(targetId, fileId, i, volumes.length, volumes[i]);
+// 滑动窗口：同时在途固定数量的分卷，每完成一卷补一卷。
+// 原先逐卷 await 等于窗口为 1，吞吐被往返时延钉死（本机 256 KiB / 31ms ≈ 8 MiB/s）。
+// 窗口值须与浏览器端 util.file.js 的 MAX_IN_FLIGHT 保持一致，两边才是同一套节奏。
+const MAX_IN_FLIGHT = 24;
+let cursor = 0;
+const inflight = new Set();
+while (cursor < volumes.length || inflight.size > 0) {
+	while (cursor < volumes.length && inflight.size < MAX_IN_FLIGHT) {
+		const index = cursor++;
+		const p = me.volume(targetId, fileId, index, volumes.length, volumes[index])
+			.catch((err) => { throw err; })
+			.finally(() => { inflight.delete(p); });
+		inflight.add(p);
+	}
+	await Promise.race(inflight);
 }
 console.log(`  [2] ${volumes.length} 个分卷已发`);
 
