@@ -134,7 +134,8 @@ class TestClient {
 	// forgeTargetId 用来测路由守卫：用真密钥加密、但帧头指向别处。
 	async sendBinary(peerId, fileId, volumeIndex, totalVolumes, payload, forgeTargetId = null) {
 		const record = c.packVolumeRecord(fileId, volumeIndex, totalVolumes, payload);
-		const packed = await c.encryptRaw(this.peers[peerId].shared, record);
+		const packed = await c.encryptRaw(this.peers[peerId].shared.send, record,
+			c.binAadBytes(channelId, this.myId));
 		this.ws.send(c.packBinaryFrame(forgeTargetId || peerId, packed));
 	}
 
@@ -154,7 +155,8 @@ class TestClient {
 			try {
 				this.binaryReceived.push({
 					from: frame.peerClientId,
-					...c.unpackVolumeRecord(await c.decryptRaw(peer.shared, frame.packed))
+					...c.unpackVolumeRecord(await c.decryptRaw(peer.shared.recv, frame.packed,
+						c.binAadBytes(channelId, frame.peerClientId)))
 				});
 			} catch (e) {
 				this.binaryErrors.push(String(e && e.message ? e.message : e));
@@ -192,6 +194,7 @@ class TestClient {
 
 		// 成员列表（服务端已排除自己）
 		if (msg.a === 'l' && Array.isArray(msg.p)) {
+			if (msg.c) this.myId = msg.c;   // 方向分离需要「我是哪一个」
 			const payloads = {};
 			for (const id of msg.p) {
 				if (!this.peers[id]) {
@@ -214,12 +217,16 @@ class TestClient {
 			if (!peer.shared) {
 				// 收到的是对端公钥 -> 派生端到端会话密钥
 				const secret = await c.deriveEcdhSecret(peer.keys.privateKey, msg.p, 'P-256');
-				peer.shared = await c.derivePeerSessionKey(secret, pwKey, channelId);
-				await this._send({ a: 'c', c: msg.c, p: await c.encryptAead(peer.shared, { a: 'u', p: this.name }) });
+				peer.shared = await c.derivePeerSessionKeys(secret, pwKey, channelId, this.myId, msg.c);
+				peer.seqOut = 1;
+				await this._send({ a: 'c', c: msg.c, p: await c.encryptAead(peer.shared.send,
+					{ a: 'u', p: this.name, s: peer.seqOut }, c.peerAadBytes(channelId, this.myId)) });
 				return;
 			}
 			// 已有密钥 -> 正常业务消息
-			const inner = await c.decryptAead(peer.shared, msg.p);
+			const inner = await c.decryptAead(peer.shared.recv, msg.p, c.peerAadBytes(channelId, msg.c));
+			if (!inner || typeof inner.s !== 'number' || inner.s <= (peer.seqIn || 0)) return;
+			peer.seqIn = inner.s;
 			if (inner.a === 'u') {
 				if (!peer.username) {
 					peer.username = inner.p;
@@ -236,7 +243,10 @@ class TestClient {
 		const payloads = {};
 		for (const id in this.peers) {
 			if (this.peers[id].shared && this.peers[id].username) {
-				payloads[id] = await c.encryptAead(this.peers[id].shared, { a: 'm', t: type, d: data });
+				const peer = this.peers[id];
+				peer.seqOut = (peer.seqOut || 0) + 1;
+				payloads[id] = await c.encryptAead(peer.shared.send, { a: 'm', t: type, d: data, s: peer.seqOut },
+					c.peerAadBytes(channelId, this.myId));
 			}
 		}
 		const n = Object.keys(payloads).length;

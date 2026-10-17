@@ -117,33 +117,51 @@ check('公钥走中继是明文可转发的', typeof alicePub === 'string' && al
 
 const aliceSecret = await client.deriveEcdhSecret(alice.privateKey, bobPub, 'P-256');
 const bobSecret = await client.deriveEcdhSecret(bob.privateKey, alicePub, 'P-256');
-const keyA = await client.derivePeerSessionKey(aliceSecret, pwKey, channelId);
-const keyB = await client.derivePeerSessionKey(bobSecret, pwKey, channelId);
+const ID_A = 'a1a1a1a1a1a1a1a1';
+const ID_B = 'b2b2b2b2b2b2b2b2';
+const keysA = await client.derivePeerSessionKeys(aliceSecret, pwKey, channelId, ID_A, ID_B);
+const keysB = await client.derivePeerSessionKeys(bobSecret, pwKey, channelId, ID_B, ID_A);
 
 const chatMsg = { a: 'm', t: 'text', d: '晚上八点老地方见' };
-const sealed = await client.encryptAead(keyA, chatMsg);
-const opened = await client.decryptAead(keyB, sealed);
+const sealed = await client.encryptAead(keysA.send, chatMsg, client.peerAadBytes(channelId, ID_A));
+const opened = await client.decryptAead(keysB.recv, sealed, client.peerAadBytes(channelId, ID_A));
 check('A 加密、B 解密成功（真实聊天路径）', JSON.stringify(opened) === JSON.stringify(chatMsg),
 	`明文: ${opened.d}`);
 
-const back = await client.encryptAead(keyB, { a: 'm', t: 'text', d: '收到' });
+const back = await client.encryptAead(keysB.send, { a: 'm', t: 'text', d: '收到' },
+	client.peerAadBytes(channelId, ID_B));
 check('B 加密、A 解密成功（双向往返）',
-	(await client.decryptAead(keyA, back)).d === '收到');
+	(await client.decryptAead(keysA.recv, back, client.peerAadBytes(channelId, ID_B))).d === '收到');
+
+// 方向分离：两端各自派生一对密钥，A 的发送 == B 的接收，反之亦然；
+// 用发送密钥去解对端发来的密文必须失败（反射）。
+let reflectBlocked = false;
+try {
+	await client.decryptAead(keysB.recv, back, client.peerAadBytes(channelId, ID_B));
+} catch (e) { reflectBlocked = true; }
+check('方向分离：自己的发送密钥解不开对端发来的密文（反射不成立）', reflectBlocked);
+
+// AAD 绑定发送者：把同一份密文换个发送者身份去解，必须失败
+let aadBlocked = false;
+try {
+	await client.decryptAead(keysB.recv, sealed, client.peerAadBytes(channelId, ID_B));
+} catch (e) { aadBlocked = true; }
+check('AAD 绑定发送者：换一个发送者身份解不开', aadBlocked);
 
 // ---------------------------------------------------------------------------
 console.log('\n[5] 攻击面：这些都必须在改造后失败');
 // 5a 口令错
 const evePwKey = await client.derivePasswordKey('wrong password', ROOM);
-const eveKey = await client.derivePeerSessionKey(aliceSecret, evePwKey, channelId);
+const eveKeys = await client.derivePeerSessionKeys(aliceSecret, evePwKey, channelId, ID_A, ID_B);
 let eveBlocked = false, eveGot = null;
-try { eveGot = await client.decryptAead(eveKey, sealed); } catch (e) { eveBlocked = true; }
+try { eveGot = await client.decryptAead(eveKeys.recv, sealed, client.peerAadBytes(channelId, ID_A)); } catch (e) { eveBlocked = true; }
 check('口令错的下游算不出正确密钥', eveBlocked, eveGot ? `竟然解出 ${JSON.stringify(eveGot)}` : 'AEAD 认证失败');
 
 // 5b 房间错
 const otherRoomId = await client.sha256Hex('nodecrypt-v2|channel|' + '另一个房间');
-const wrongRoomKey = await client.derivePeerSessionKey(aliceSecret, pwKey, otherRoomId);
+const wrongRoomKeys = await client.derivePeerSessionKeys(aliceSecret, pwKey, otherRoomId, ID_A, ID_B);
 let roomBlocked = false;
-try { await client.decryptAead(wrongRoomKey, sealed); } catch (e) { roomBlocked = true; }
+try { await client.decryptAead(wrongRoomKeys.recv, sealed, client.peerAadBytes(channelId, ID_A)); } catch (e) { roomBlocked = true; }
 check('同口令不同房间 => 密钥不同 => 解不开', roomBlocked);
 
 // 5c 密文被篡改（原实现完全无法发现）

@@ -12,7 +12,8 @@ import {
 } from './room.js';
 import {
 	escapeHTML,
-	resolveDisplayName
+	resolveDisplayName,
+	assessPasswordStrength
 } from './util.string.js';
 import {
 	$id
@@ -516,6 +517,12 @@ export function loginFormHandler(modal) {
 				btn.innerText = t('ui.enter', 'ENTER')
 			}
 			setConnectStatus(null)
+			// 口令强度只提示不阻断。放在进房成功之后，是因为登录表单随即隐藏，
+			// 表单下方的提示用户根本看不到；系统消息才是他一定会读到的地方。
+			const pwdNotice = assessPasswordStrength(password);
+			if (pwdNotice && typeof window.addSystemMsg === 'function') {
+				window.addSystemMsg(t(pwdNotice, 'Weak room password'))
+			}
 		})
 	}
 }

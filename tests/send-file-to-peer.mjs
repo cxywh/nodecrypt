@@ -143,6 +143,7 @@ class Sender {
 		}
 
 		if (msg.a === 'l' && Array.isArray(msg.p)) {
+		if (msg.c) this.myId = msg.c;
 			const payloads = {};
 			for (const id of msg.p) {
 				if (!this.peers[id]) {
@@ -169,12 +170,16 @@ class Sender {
 			if (!peer.shared) {
 				console.log(`    ← 收到 ${msg.c} 的公钥，派生会话密钥并回我的用户名`);
 				const secret = await c.deriveEcdhSecret(peer.keys.privateKey, msg.p, 'P-256');
-				peer.shared = await c.derivePeerSessionKey(secret, pwKey, channelId);
-				await this._send({ a: 'c', c: msg.c, p: await c.encryptAead(peer.shared, { a: 'u', p: this.name }) });
+				peer.shared = await c.derivePeerSessionKeys(secret, pwKey, channelId, this.myId, msg.c);
+				peer.seqOut = 1;
+				await this._send({ a: 'c', c: msg.c, p: await c.encryptAead(peer.shared.send,
+					{ a: 'u', p: this.name, s: peer.seqOut }, c.peerAadBytes(channelId, this.myId)) });
 				return;
 			}
 			console.log(`    ← 收到 ${msg.c} 的密文，尝试解密`);
-			const inner = await c.decryptAead(peer.shared, msg.p);
+			const inner = await c.decryptAead(peer.shared.recv, msg.p, c.peerAadBytes(channelId, msg.c));
+			if (!inner || typeof inner.s !== 'number' || inner.s <= (peer.seqIn || 0)) return;
+			peer.seqIn = inner.s;
 			if (inner.a === 'u' && !peer.username) peer.username = inner.p;
 			else if (inner.a === 'm') this.messages.push({ from: peer.username, t: inner.t });
 		}
@@ -183,13 +188,16 @@ class Sender {
 	/** 给某个对端发业务消息（等价于前端 NodeCrypt 的 broadcast 单发）。 */
 	async to(peerId, type, data) {
 		const peer = this.peers[peerId];
-		await this._send({ a: 'w', p: { [peerId]: await c.encryptAead(peer.shared, { a: 'm', t: type, d: data }) } });
+		peer.seqOut = (peer.seqOut || 0) + 1;
+		await this._send({ a: 'w', p: { [peerId]: await c.encryptAead(peer.shared.send,
+			{ a: 'm', t: type, d: data, s: peer.seqOut }, c.peerAadBytes(channelId, this.myId)) } });
 	}
 
 	/** 二进制分卷：只按对端密钥加密一次，不套服务端信封 —— 与前端一致。 */
 	async volume(peerId, fileId, index, total, payload) {
 		const record = c.packVolumeRecord(fileId, index, total, payload);
-		this.ws.send(c.packBinaryFrame(peerId, await c.encryptRaw(this.peers[peerId].shared, record)));
+		this.ws.send(c.packBinaryFrame(peerId, await c.encryptRaw(this.peers[peerId].shared.send, record,
+			c.binAadBytes(channelId, this.myId))));
 	}
 }
 

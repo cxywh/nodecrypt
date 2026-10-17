@@ -12,7 +12,7 @@ import {
 	BIN_FRAME_CHANNEL, CLIENT_ID_BYTES,
 	encryptAead, decryptAead, toB64,
 	generateEcdhKeyPair, exportEcdhPublic, deriveEcdhSecret,
-	derivePasswordKey, derivePeerSessionKey
+	derivePasswordKey, derivePeerSessionKeys
 } from '../client/js/aead.js';
 
 let pass = 0, fail = 0;
@@ -44,20 +44,25 @@ const ROOM = 'binary-channel-room';
 
 // 造一把真的会话密钥：走完整的 ECDH + PBKDF2 + HKDF 派生，而不是随手造一个
 // 随机密钥 import 进来 —— 后者会掩盖「派生参数不匹配」这类真问题。
+const ID_A = 'a1a1a1a1a1a1a1a1';
+const ID_B = 'b2b2b2b2b2b2b2b2';
+
 async function makeSessionKeys(channelId = 'deadbeefdeadbeef') {
 	const pwKey = await derivePasswordKey(PASSWORD, ROOM);
 	const a = await generateEcdhKeyPair('P-256');
 	const b = await generateEcdhKeyPair('P-256');
 	const secretA = await deriveEcdhSecret(a.privateKey, await exportEcdhPublic(b));
 	const secretB = await deriveEcdhSecret(b.privateKey, await exportEcdhPublic(a));
-	const keyA = await derivePeerSessionKey(secretA, pwKey, channelId);
-	const keyB = await derivePeerSessionKey(secretB, pwKey, channelId);
-	return { keyA, keyB };
+	// 方向分离：A（id 小）用 c2s 发送，B 用同一把 c2s 接收，
+	// 因此 keyA == keyB 的原始密钥，但 keyB.send 是另一把（用于反射断言）。
+	const keysA = await derivePeerSessionKeys(secretA, pwKey, channelId, ID_A, ID_B);
+	const keysB = await derivePeerSessionKeys(secretB, pwKey, channelId, ID_B, ID_A);
+	return { keyA: keysA.send, keyB: keysB.recv, keysA, keysB };
 }
 
 console.log('\n【1】裸 AEAD（encryptRaw / decryptRaw）');
 
-const { keyA, keyB } = await makeSessionKeys();
+const { keyA, keyB, keysA, keysB } = await makeSessionKeys();
 
 await check('往返：256KB 载荷原样还原', async () => {
 	const data = randomBytes(256 * 1024);
@@ -65,6 +70,11 @@ await check('往返：256KB 载荷原样还原', async () => {
 	const out = await decryptRaw(keyB, packed);
 	assert(out.length === data.length, `长度不符 ${out.length}`);
 	assert(out.every((v, i) => v === data[i]), '内容不符');
+});
+
+await check('方向分离：反射密文（对端用自己的发送密钥加密）解不开', async () => {
+	const packed = await encryptRaw(keysB.send, randomBytes(64));
+	await throws(() => decryptRaw(keysA.send, packed), '反射密文竟然解开了');
 });
 
 await check('往返：空载荷（0 字节）', async () => {

@@ -145,16 +145,45 @@ export async function deriveServerSessionKey(ecdhSecret) {
 }
 
 /**
- * 客户端 ↔ 客户端会话密钥。
+ * 对端通道的 AAD：绑定房间标识与发送者 clientId。
+ *
+ * 两个通道原先用常量 AAD，密文与上下文的绑定完全依赖「密钥不同」这一点。
+ * 加入房间标识与发送者之后，同一把密钥下跨房间或跨发送者的密文会验证失败，
+ * 这是 AES-GCM 的 AAD 本应承担的职责。
+ */
+export function peerAadBytes(channelId, senderClientId) {
+	return te.encode('nodecrypt-v2|peer|' + String(channelId) + '|' + String(senderClientId));
+}
+
+/** 二进制通道的 AAD，域与 JSON 通道分离，且同样绑定房间与发送者。 */
+export function binAadBytes(channelId, senderClientId) {
+	return te.encode('nodecrypt-v2|bin|' + String(channelId) + '|' + String(senderClientId));
+}
+
+/**
+ * 客户端 ↔ 客户端会话密钥，每个方向一把。
+ *
  * ikm = ECDH 共享秘密（P-256 => 32 字节）‖ PBKDF2(口令)  <- 两个因子都必需
  * salt = 房间标识（同口令不同房间 => 不同密钥）
+ * info = peer-session|c2s 与 peer-session|s2c
+ *
+ * 两个方向分别派生：复用同一把密钥时，把对端发来的密文原样回送，会被自己的
+ * AEAD 验证通过（反射）；方向分离后回送的密文落在错误的密钥上，直接失败。
+ *
+ * 谁是 c2s 由 clientId 字典序决定。两端对同一对 id 得出同一结论，不需要额外
+ * 协商，也不会随连接先后漂移。字符串比较用码元顺序，与区域设置无关。
  */
-export async function derivePeerSessionKey(ecdhSecret, passwordKey, channelId) {
+export async function derivePeerSessionKeys(ecdhSecret, passwordKey, channelId, myClientId, peerClientId) {
 	const ikm = new Uint8Array(ecdhSecret.length + passwordKey.length);
 	ikm.set(ecdhSecret, 0);
 	ikm.set(passwordKey, ecdhSecret.length);
-	const raw = await hkdf(ikm, channelId, 'peer-session', 256);
-	return importAesKey(raw);
+	const mine = String(myClientId);
+	const theirs = String(peerClientId);
+	const lowFirst = mine < theirs;
+	return {
+		send: await importAesKey(await hkdf(ikm, channelId, lowFirst ? 'peer-session|c2s' : 'peer-session|s2c', 256)),
+		recv: await importAesKey(await hkdf(ikm, channelId, lowFirst ? 'peer-session|s2c' : 'peer-session|c2s', 256))
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +223,7 @@ export async function deriveEcdhSecret(privateKey, publicKeyHex, namedCurve = 'P
 // 与原格式的差别：原来是 base64(iv) + '|' + base64(密文)（且零填充、无 tag）
 // ---------------------------------------------------------------------------
 
-export async function encryptAead(key, message) {
+export async function encryptAead(key, message, aad = AEAD_AAD) {
 	if (!key) {
 		throw new Error('encryptAead: missing key');
 	}
@@ -203,7 +232,7 @@ export async function encryptAead(key, message) {
 	const ciphertext = await crypto.subtle.encrypt({
 		name: 'AES-GCM',
 		iv,
-		additionalData: AEAD_AAD
+		additionalData: aad
 	}, key, plaintext);
 	return toB64(iv) + '|' + toB64(ciphertext);
 }
@@ -213,7 +242,7 @@ export async function encryptAead(key, message) {
  * 原实现（CBC 零填充 / 裸 ChaCha20）会安静地返回垃圾或抛解析错，
  * 调用方无法区分「被篡改」和「还没协商好」。
  */
-export async function decryptAead(key, packed) {
+export async function decryptAead(key, packed, aad = AEAD_AAD) {
 	if (!key) {
 		throw new Error('decryptAead: missing key');
 	}
@@ -224,7 +253,7 @@ export async function decryptAead(key, packed) {
 	const plaintext = await crypto.subtle.decrypt({
 		name: 'AES-GCM',
 		iv: fromB64(parts[0]),
-		additionalData: AEAD_AAD
+		additionalData: aad
 	}, key, fromB64(parts[1]));
 	return JSON.parse(td.decode(plaintext));
 }
@@ -254,7 +283,7 @@ export async function decryptAead(key, packed) {
 
 export const BIN_FRAME_CHANNEL = 0x02;
 export const CLIENT_ID_BYTES = 16;
-const AEAD_AAD_BIN = new TextEncoder().encode('nodecrypt-v2|bin');
+const AEAD_AAD_BIN = new TextEncoder().encode('nodecrypt-v2|bin'); // 默认值，调用方会传入 binAadBytes
 const TAG_BYTES = 16;
 
 /**

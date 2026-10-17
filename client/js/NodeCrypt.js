@@ -16,7 +16,7 @@ import {
 	exportEcdhPublic,
 	deriveEcdhSecret,
 	deriveServerSessionKey,
-	derivePeerSessionKey,
+	derivePeerSessionKeys,
 	derivePasswordKey,
 	encryptAead,
 	decryptAead,
@@ -25,7 +25,9 @@ import {
 	decryptRaw,
 	packBinaryFrame,
 	unpackBinaryFrame,
-	unpackVolumeRecord
+	unpackVolumeRecord,
+	peerAadBytes,
+	binAadBytes
 } from './aead.js';
 import { createTurnstileGate } from './util.turnstile.js';
 
@@ -387,6 +389,11 @@ class NodeCrypt {
 			return
 		}
 		if (serverDecrypted.a === 'l' && this.isArray(serverDecrypted.p)) {
+			// 服务端在成员名单里带回收件人自己的 clientId。方向分离需要「我是哪一个」，
+			// 这条是唯一来源；与对端 id 比较后两端得出同一个 c2s/s2c 结论。
+			if (this.isString(serverDecrypted.c)) {
+				this.myClientId = serverDecrypted.c;
+			}
 			try {
 				for (const clientId in this.channel) {
 					if (serverDecrypted.p.indexOf(clientId) < 0) {
@@ -400,6 +407,8 @@ class NodeCrypt {
 							username: null,
 							keys: await generateEcdhKeyPair('P-256'),
 							shared: null,
+							seqOut: 0,
+							seqIn: 0,
 						};
 						payloads[clientId] = await exportEcdhPublic(this.channel[clientId].keys)
 					}
@@ -441,6 +450,8 @@ class NodeCrypt {
 						username: null,
 						keys: await generateEcdhKeyPair('P-256'),
 						shared: null,
+						seqOut: 0,
+						seqIn: 0,
 					};
 					this.sendMessage(await this.encryptServerMessage({
 						a: 'c',
@@ -455,17 +466,19 @@ class NodeCrypt {
 					serverDecrypted.p,
 					'P-256'
 				);
-				this.channel[serverDecrypted.c].shared = await derivePeerSessionKey(
+				this.channel[serverDecrypted.c].shared = await derivePeerSessionKeys(
 					secret,
 					this.passwordKey,
-					this.credentials.channelId
+					this.credentials.channelId,
+					this.myClientId,
+					serverDecrypted.c
 				);
 				this.sendMessage(await this.encryptServerMessage({
 					a: 'c',
 					p: await this.encryptClientMessage({
 						a: 'u',
 						p: this.credentials.username
-					}, this.channel[serverDecrypted.c].shared),
+					}, this.channel[serverDecrypted.c]),
 					c: serverDecrypted.c
 				}, this.serverShared))
 			} catch (error) {
@@ -474,7 +487,7 @@ class NodeCrypt {
 			return
 		}
 		if (serverDecrypted.a === 'c' && this.channel[serverDecrypted.c] && this.channel[serverDecrypted.c].shared) {
-			const clientDecrypted = await this.decryptClientMessage(serverDecrypted.p, this.channel[serverDecrypted.c].shared);
+			const clientDecrypted = await this.decryptClientMessage(serverDecrypted.p, serverDecrypted.c);
 			// 这里是**用户聊天内容的明文**。绝不能进日志 ——
 			// debug 一开，用户说的每句话都会落在控制台里。
 			this.logEvent('onMessage-client-decrypted', this.isObject(clientDecrypted) ? 'a=' + clientDecrypted.a : typeof clientDecrypted);
@@ -654,7 +667,7 @@ class NodeCrypt {
 							a: 'm',
 							t: type,
 							d: data
-						}, this.channel[clientId].shared);
+						}, this.channel[clientId]);
 						if (payloads[clientId].length === 0) {
 							return (false)
 						}
@@ -702,7 +715,11 @@ class NodeCrypt {
 			}
 			let sent = 0
 			for (const clientId of ready) {
-				const packed = await encryptRaw(this.channel[clientId].shared, plaintext)
+				const packed = await encryptRaw(
+					this.channel[clientId].shared.send,
+					plaintext,
+					binAadBytes(this.credentials.channelId, this.myClientId)
+				)
 				if (this.sendMessage(packBinaryFrame(clientId, packed))) {
 					sent++
 				}
@@ -727,7 +744,11 @@ class NodeCrypt {
 		}
 		let record
 		try {
-			record = unpackVolumeRecord(await decryptRaw(peer.shared, frame.packed))
+			record = unpackVolumeRecord(await decryptRaw(
+				peer.shared.recv,
+				frame.packed,
+				binAadBytes(this.credentials.channelId, frame.peerClientId)
+			))
 		} catch (error) {
 			// 解不开可能是密钥轮换途中的旧帧，也可能是篡改。
 			// 记日志但不往外抛 —— 一条坏帧不该打断整个房间的消息处理链。
@@ -768,9 +789,18 @@ class NodeCrypt {
 
 	// Encrypt a message for a client
 	// 加密发送给客户端的消息
-	async encryptClientMessage(message, key) {
+	//
+	// 序号 s 按对端递增，随明文一起进 AEAD，服务端既改不动也抹不掉。接收端只接受
+	// 严格递增的序号，重放的报文在这里被丢弃，不会被当成一条新消息渲染（文件消息
+	// 重放会重复触发接收）。
+	async encryptClientMessage(message, peer) {
 		try {
-			return await encryptAead(key, message)
+			if (!peer || !peer.shared) {
+				throw new Error('encryptClientMessage: 对端密钥尚未建立');
+			}
+			const seq = (peer.seqOut = (peer.seqOut || 0) + 1);
+			return await encryptAead(peer.shared.send, { ...message, s: seq },
+				peerAadBytes(this.credentials.channelId, this.myClientId))
 		} catch (error) {
 			this.logEvent('encryptClientMessage', error, 'error')
 			return ('')
@@ -779,9 +809,25 @@ class NodeCrypt {
 
 	// Decrypt a message from a client
 	// 解密来自客户端的消息
-	async decryptClientMessage(message, key) {
+	//
+	// senderClientId 决定三件事：用哪把接收密钥、AAD 里的发送者字段、序号水位。
+	async decryptClientMessage(message, senderClientId) {
 		try {
-			return await decryptAead(key, message)
+			const peer = this.channel[senderClientId];
+			if (!peer || !peer.shared) {
+				return ({})
+			}
+			const decrypted = await decryptAead(peer.shared.recv, message,
+				peerAadBytes(this.credentials.channelId, senderClientId));
+			if (!this.isObject(decrypted) || typeof decrypted.s !== 'number') {
+				throw new Error('decryptClientMessage: 报文缺少序号');
+			}
+			if (decrypted.s <= (peer.seqIn || 0)) {
+				throw new Error('decryptClientMessage: 序号未递增，按重放丢弃');
+			}
+			peer.seqIn = decrypted.s;
+			delete decrypted.s;
+			return decrypted
 		} catch (error) {
 			this.logEvent('decryptClientMessage', error, 'error')
 			return ({})

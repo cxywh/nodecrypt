@@ -139,6 +139,7 @@ class Client {
 		if (!msg || !msg.a) return;
 
 		if (msg.a === 'l' && Array.isArray(msg.p)) {
+			if (msg.c) this.myId = msg.c;
 			const payloads = {};
 			for (const id of msg.p) {
 				if (!this.peers[id]) {
@@ -158,11 +159,15 @@ class Client {
 			}
 			if (!peer.shared) {
 				const secret = await c.deriveEcdhSecret(peer.keys.privateKey, msg.p, 'P-256');
-				peer.shared = await c.derivePeerSessionKey(secret, this.pwKey, this.channelId);
-				await this.send({ a: 'c', c: msg.c, p: await c.encryptAead(peer.shared, { a: 'u', p: this.name }) });
+				peer.shared = await c.derivePeerSessionKeys(secret, this.pwKey, this.channelId, this.myId, msg.c);
+				peer.seqOut = 1;
+				await this.send({ a: 'c', c: msg.c, p: await c.encryptAead(peer.shared.send,
+					{ a: 'u', p: this.name, s: peer.seqOut }, c.peerAadBytes(this.channelId, this.myId)) });
 				return;
 			}
-			const inner = await c.decryptAead(peer.shared, msg.p);
+			const inner = await c.decryptAead(peer.shared.recv, msg.p, c.peerAadBytes(this.channelId, msg.c));
+			if (!inner || typeof inner.s !== 'number' || inner.s <= (peer.seqIn || 0)) return;
+			peer.seqIn = inner.s;
 			if (inner.a === 'u') {
 				if (!peer.username) { peer.username = inner.p; this.securePeers++; }
 				return;
@@ -175,7 +180,10 @@ class Client {
 		const payloads = {};
 		for (const id in this.peers) {
 			if (this.peers[id].shared && this.peers[id].username) {
-				payloads[id] = await c.encryptAead(this.peers[id].shared, { a: 'm', t: type, d: data });
+				const peer = this.peers[id];
+				peer.seqOut = (peer.seqOut || 0) + 1;
+				payloads[id] = await c.encryptAead(peer.shared.send, { a: 'm', t: type, d: data, s: peer.seqOut },
+					c.peerAadBytes(this.channelId, this.myId));
 			}
 		}
 		const n = Object.keys(payloads).length;
