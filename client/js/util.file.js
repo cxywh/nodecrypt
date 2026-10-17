@@ -57,56 +57,66 @@ async function calculateHash(data) {
 
 
 
+// 已压缩格式判定：这些容器的载荷本身就是压缩流，再 deflate 不会变小。
+// 实测 64 MiB 随机数据经 level 6 后变成 67122464 字节（**膨胀 13600**），
+// 耗时 862 ms，线性外推到 2 GiB 约 28 秒且全程占住主线程。
+const INCOMPRESSIBLE_MIME = /^(video\/|image\/(jpeg|png|gif|webp|heic|heif|avif)|audio\/(mpeg|mp4|aac|flac|opus))/;
+const INCOMPRESSIBLE_EXT = /\.(mp4|m4v|mkv|mov|avi|webm|flv|mp3|m4a|aac|flac|ogg|opus|jpg|jpeg|png|gif|webp|heic|avif|zip|rar|7z|gz|bz2|xz|pdf|docx|xlsx|pptx|apk|ipa|jar|woff2?)$/i;
+
+// 按 MIME 与扩展名双重判定：file_start 里没有 MIME 字段，接收端只靠扩展名不可靠，
+// 所以发送端两种信息都用上。判不准时倾向压缩 —— 错压只是浪费 CPU，漏压会让文件变大。
+function isIncompressible(file) {
+	if (INCOMPRESSIBLE_EXT.test(file.name || '')) return true;
+	return INCOMPRESSIBLE_MIME.test((file.type || '').toLowerCase());
+}
+
 // Compress file into volumes with optimized compression
 // 将文件压缩为分卷，优化压缩算法
+//
+// 分卷用 subarray（视图，零拷贝）而不是 slice（每卷复制一份）：
+// 2 GiB 文件原先峰值约有「源缓冲 + 压缩结果 + 分卷副本」三份，
+// 现在压缩路径只有「压缩结果 + 视图」，不压缩路径只有一份源缓冲。
 async function compressFileToVolumes(file, volumeSize = DEFAULT_VOLUME_SIZE) { // 96KB原始数据，base64后约128KB
-	return new Promise((resolve, reject) => {
-		const reader = new FileReader();
-		reader.onload = async function(e) {
-			const arrayBuffer = new Uint8Array(e.target.result);
-			
-			try {
-				// Calculate hash of original file for integrity
-				const originalHash = await calculateHash(arrayBuffer);
-				
-				// Use single compression pass with balanced compression
-				// 使用单次压缩，平衡压缩率和速度
-				deflate(arrayBuffer, { 
-					level: 6, // 平衡压缩级别
-					mem: 8    // 合理内存使用
-				}, (err, compressed) => {
-					if (err) {
-						reject(err);
-						return;
-					}
-					
-					// 切成**裸二进制**分卷 —— 不再 base64。
-					//
-					// 载荷反正要整体 AES-GCM 加密，密文本来就是二进制的，
-					// 先转成 base64 再塞进 JSON 是纯浪费：链路上会变成
-					// base64 ① × 每对端信封 base64 ② × 服务端信封 base64 ③
-					// = 1.333³ = 2.37×（实测 137% 膨胀）。
-					// 现在分卷直接走二进制帧，同一份实测膨胀 0.017%。
-					const volumes = [];
-					for (let i = 0; i < compressed.length; i += volumeSize) {
-						const volume = compressed.slice(i, i + volumeSize);
-						volumes.push(volume);
-					}
-					
-					resolve({
-						volumes,
-						originalSize: file.size,
-						compressedSize: compressed.length,
-						originalHash
-					});
-				});
-			} catch (hashError) {
-				reject(hashError);
-			}
-		};
-		reader.onerror = () => reject(reader.error);
-		reader.readAsArrayBuffer(file);
-	});
+	const arrayBuffer = new Uint8Array(await readFileAsArrayBuffer(file));
+
+	// Calculate hash of original file for integrity
+	const originalHash = await calculateHash(arrayBuffer);
+
+	// 不可压缩的类型直接跳过 deflate：省下整份压缩副本与一次全量 CPU 阻塞。
+	let payload = arrayBuffer;
+	let compression = 'none';
+
+	if (!isIncompressible(file)) {
+		payload = await new Promise((resolve, reject) => {
+			// Use single compression pass with balanced compression
+			// 使用单次压缩，平衡压缩率和速度
+			deflate(arrayBuffer, {
+				level: 6, // 平衡压缩级别
+				mem: 8    // 合理内存使用
+			}, (err, compressed) => (err ? reject(err) : resolve(compressed)));
+		});
+		compression = 'deflate';
+	}
+
+	// 切成**裸二进制**分卷 —— 不再 base64。
+	//
+	// 载荷反正要整体 AES-GCM 加密，密文本来就是二进制的，
+	// 先转成 base64 再塞进 JSON 是纯浪费：链路上会变成
+	// base64 ① × 每对端信封 base64 ② × 服务端信封 base64 ③
+	// = 1.333³ = 2.37×（实测 137% 膨胀）。
+	// 现在分卷直接走二进制帧，同一份实测膨胀 0.017%。
+	const volumes = [];
+	for (let i = 0; i < payload.length; i += volumeSize) {
+		volumes.push(payload.subarray(i, i + volumeSize));
+	}
+
+	return {
+		volumes,
+		originalSize: file.size,
+		compressedSize: payload.length,
+		originalHash,
+		compression
+	};
 }
 
 // Compress multiple files into a single archive with volumes
@@ -179,8 +189,8 @@ async function compressFilesToArchive(files, volumeSize = DEFAULT_VOLUME_SIZE) {
 				// 现在分卷直接走二进制帧，同一份实测膨胀 0.017%。
 				const volumes = [];
 				for (let i = 0; i < compressed.length; i += volumeSize) {
-					const volume = compressed.slice(i, i + volumeSize);
-					volumes.push(volume);
+					// 视图而非复制：整份压缩结果已经占一份内存，再逐卷复制会翻倍。
+					volumes.push(compressed.subarray(i, i + volumeSize));
 				}
 				
 				resolve({
@@ -189,7 +199,9 @@ async function compressFilesToArchive(files, volumeSize = DEFAULT_VOLUME_SIZE) {
 					compressedSize: compressed.length,
 					archiveHash,
 					fileCount: files.length,
-					fileManifest
+					fileManifest,
+					// 归档仍走 deflate：多个文件混合，按单文件类型判定没有意义。
+					compression: 'deflate'
 				});
 			});
 		});
@@ -225,7 +237,7 @@ function volumeToBytes(volume) {
 
 // 拼装分卷并解压，返回明文字节。不保存，也不吞异常。
 // 下载与图片预览共用这一条路径，两者得到的字节因此完全一致。
-async function assembleFileBytes(volumes, originalHash = null) {
+async function assembleFileBytes(volumes, originalHash = null, compression = 'deflate') {
 	// Combine all volumes（形态归一化后再拼装）
 	const combinedData = volumes.map(volumeToBytes);
 
@@ -238,9 +250,13 @@ async function assembleFileBytes(volumes, originalHash = null) {
 		offset += data.length;
 	}
 
-	const decompressed = await new Promise((resolve, reject) => {
-		inflate(compressed, (err, out) => (err ? reject(err) : resolve(out)));
-	});
+	// 未压缩的载荷就是明文，直接跳过 inflate：省一次解压，也省掉一份解压副本。
+	// 缺省按 deflate 处理 —— 旧客户端不带该字段，必须保持原行为。
+	const decompressed = compression === 'none'
+		? compressed
+		: await new Promise((resolve, reject) => {
+			inflate(compressed, (err, out) => (err ? reject(err) : resolve(out)));
+		});
 
 	// Verify hash if provided
 	if (originalHash) {
@@ -260,9 +276,9 @@ async function assembleFileBytes(volumes, originalHash = null) {
 
 // Decompress volumes back to file
 // 将分卷解压回文件
-async function decompressVolumesToFile(volumes, fileName, originalHash = null) {
+async function decompressVolumesToFile(volumes, fileName, originalHash = null, compression = 'deflate') {
 	try {
-		const decompressed = await assembleFileBytes(volumes, originalHash);
+		const decompressed = await assembleFileBytes(volumes, originalHash, compression);
 
 		// 走统一的保存入口：浏览器里是 <a download>，安卓壳里转原生桥。
 		// 这里原来是内联的 blob + <a download>，在 WebView 里会静默失效。
@@ -275,7 +291,7 @@ async function decompressVolumesToFile(volumes, fileName, originalHash = null) {
 
 // Decompress archive volumes to multiple files
 // 将归档分卷解压为多个文件
-async function decompressArchiveToFiles(volumes, fileManifest, archiveHash = null) {
+async function decompressArchiveToFiles(volumes, fileManifest, archiveHash = null, compression = 'deflate') {
 	try {
 		// Combine all volumes（形态归一化后再拼装）
 		const combinedData = volumes.map(volumeToBytes);
@@ -419,7 +435,7 @@ async function handleFilesUpload(files, onSend, onSendBinary) {
 			const file = files[0];
 			showProgress();
 			
-			const { volumes, originalSize, compressedSize, originalHash } = await compressFileToVolumes(file);
+			const { volumes, originalSize, compressedSize, originalHash, compression } = await compressFileToVolumes(file);
 			
 			updateProgress();
 			
@@ -433,6 +449,7 @@ async function handleFilesUpload(files, onSend, onSendBinary) {
 				sentVolumes: 0,
 				status: 'sending',
 				originalHash,
+				compression,
 				localFile: file // 仅用于本机预览，不参与传输
 			};
 			
@@ -446,7 +463,8 @@ async function handleFilesUpload(files, onSend, onSendBinary) {
 				originalSize,
 				compressedSize,
 				totalVolumes: volumes.length,
-				originalHash
+				originalHash,
+				compression
 			});
 			
 			// Send volumes
@@ -457,7 +475,7 @@ async function handleFilesUpload(files, onSend, onSendBinary) {
 			const totalSize = files.reduce((sum, file) => sum + file.size, 0);
 			showProgress();
 			
-			const { volumes, originalSize, compressedSize, archiveHash, fileCount, fileManifest } = await compressFilesToArchive(files);
+			const { volumes, originalSize, compressedSize, archiveHash, fileCount, fileManifest, compression } = await compressFilesToArchive(files);
 			
 			updateProgress();
 			
@@ -473,7 +491,8 @@ async function handleFilesUpload(files, onSend, onSendBinary) {
 				archiveHash,
 				fileCount,
 				fileManifest,
-				isArchive: true
+				isArchive: true,
+				compression
 			};
 			
 			window.fileTransfers.set(fileId, fileTransfer);
@@ -489,7 +508,8 @@ async function handleFilesUpload(files, onSend, onSendBinary) {
 				archiveHash,
 				fileCount,
 				fileManifest,
-				isArchive: true
+				isArchive: true,
+				compression
 			});
 			
 			// Send volumes
@@ -922,7 +942,7 @@ function handleFileOffer(message, isPrivate) {
 // Handle file start message
 // 处理文件开始消息
 function handleFileStart(message, isPrivate) {
-	const { fileId, fileName, originalSize, compressedSize, totalVolumes, originalHash, archiveHash, fileCount, fileManifest, isArchive, userName } = message;
+	const { fileId, fileName, originalSize, compressedSize, totalVolumes, originalHash, archiveHash, fileCount, fileManifest, isArchive, userName, compression } = message;
 	// fileId 由对端提供，会进入 DOM 属性与 CSS 选择器。不符合生成器字符集的一律丢弃，
 	// 避免畸形标识在渲染阶段被当作标记解析。
 	if (!isSafeFileId(fileId)) return;
@@ -938,6 +958,8 @@ function handleFileStart(message, isPrivate) {
 		status: 'receiving',
 		originalHash,
 		archiveHash,
+		// 缺省 deflate：不带该字段的是旧对端。
+		compression: compression === 'none' ? 'none' : 'deflate',
 		fileCount,
 		fileManifest,
 		isArchive,
@@ -1077,11 +1099,11 @@ export async function downloadFile(fileId) {
 	try {
 		if (transfer.isArchive) {
 			// Download archive as multiple files
-			await decompressArchiveToFiles(transfer.volumeData, transfer.fileManifest, transfer.archiveHash);
+			await decompressArchiveToFiles(transfer.volumeData, transfer.fileManifest, transfer.archiveHash, transfer.compression);
 			// 删除系统提示
 		} else {
 			// Download single file
-			await decompressVolumesToFile(transfer.volumeData, transfer.fileName, transfer.originalHash);
+			await decompressVolumesToFile(transfer.volumeData, transfer.fileName, transfer.originalHash, transfer.compression);
 			// 删除系统提示
 		}
 	} catch (error) {
